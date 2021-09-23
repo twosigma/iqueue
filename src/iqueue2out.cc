@@ -66,7 +66,7 @@ void iqueue2fd(ts::mmia::cpputils::iqueue& iq, int fd) {
             warnx("Message is unrealistically huge. Truncating to 4096.");
             msg = { msg.data(), 4096 };
         }
-        ssize_t written = try_(write(fd, reinterpret_cast<char const*>(msg.data()), msg.size()));
+        size_t written = try_(write(fd, reinterpret_cast<char const*>(msg.data()), msg.size()));
         if (written != msg.size()) {
             warnx("Partial write? Did I get called with a non-packetized pipe?");
             exit(1);

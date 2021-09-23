@@ -58,7 +58,7 @@ gsl::span<gsl::byte> read_fd(int fd) {
     static gsl::byte buf[4096];
     int ret = try_(read(fd, buf, sizeof(buf)));
     if (ret == 0) exit(0);
-    return { buf, static_cast<ssize_t>(ret) };
+    return { buf, static_cast<decltype(read_fd(0))::size_type>(ret) };
 }
 
 void fd2iqueue(int fd, ts::mmia::cpputils::iqueue& iq) {

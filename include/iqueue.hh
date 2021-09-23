@@ -68,7 +68,7 @@ struct iqueue_const_iterator
     reference operator*() const {
         std::size_t size = 0;
         void const* ptr = iqueue_data(_iqueue, _id, &size);
-        _current = {static_cast<gsl::byte const*>(ptr), static_cast<decltype(_current)::index_type>(size)};
+        _current = {static_cast<gsl::byte const*>(ptr), static_cast<size_t>(size)};
         return _current;
     }
 
@@ -380,7 +380,7 @@ struct iqueue
     gsl::span<gsl::byte const> header() const {
         std::size_t size = 0;
         auto data = iqueue_header(_iqueue, &size);
-        return {reinterpret_cast<gsl::byte const *>(data), static_cast<decltype(header())::index_type>(size)};
+        return {reinterpret_cast<gsl::byte const *>(data), static_cast<size_t>(size)};
     }
 
     // Returns the file name of the iqueue.
