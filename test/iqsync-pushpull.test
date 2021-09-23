@@ -1,0 +1,172 @@
+#! /bin/bash
+#   Copyright 2021 Two Sigma Open Source, LLC
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+# Global settings
+DIR=$(dirname $0)
+PROG=$(basename $0)
+PKGDIR=$(cd $(dirname ${0})/../..; pwd -L)
+
+# Populate the TS_*_HOME variables
+eval $($(${PKGDIR}/bin/gettools)/bin/makepath -s -r ${PKGDIR})
+
+WORKDIR="$(mktemp -d -t $PROG.XXXXXXXXXX)"
+DCATSIMPLE=${TS_DCAT_NATIVE_HOME}/bin/dcatsimple
+trap "rm -fr $WORKDIR" 0 1 2 3 15
+
+echo Using $WORKDIR
+IQ1=$WORKDIR/iq1.iqx
+IQ2=$WORKDIR/iq2.iqx
+
+die() {
+    echo >&2 "$@"
+    exit 1
+}
+
+warn() {
+    echo >&2 "$@"
+}
+
+export IQSYNC_CMD=${PKGDIR}/bin/iqsync
+export IQSYNC_RSH=${PKGDIR}/sh/nop-ssh
+
+iqueue-append() {
+    $PKGDIR/bin/iqueue \
+	--append \
+	-f $1 \
+    || die "$1: Unable to append"
+}
+
+
+${PKGDIR}/bin/iqueue \
+    --create \
+    -f $IQ1 \
+|| die "$IQ1: Unable to create"
+
+${PKGDIR}/bin/iqueue \
+    --create \
+    -f $IQ2 \
+|| die "$IQ2: Unable to create"
+
+echo "iq1 first entry" | iqueue-append $IQ1
+echo "iq1 second entry" | iqueue-append $IQ1
+echo "iq2 first entry" | iqueue-append $IQ2
+echo "iq2 second entry" | iqueue-append $IQ2
+
+
+#
+# Test the non-tail case in bidirectional, which should just exchange the
+# two items
+#
+${PKGDIR}/bin/iqsync \
+    -f $IQ2 \
+    --sleep 100 \
+    --report-interval 5 \
+    --pull \
+    --push \
+    --verbose \
+    localhost:$IQ1 \
+
+
+${PKGDIR}/bin/iqueue -f $IQ1 -b > $WORKDIR/iq1.txt
+cat <<EOF | diff - $WORKDIR/iq1.txt || die "iq1 failed comparison": `cat $WORKDIR/iq1.txt`
+iq1 first entry
+iq1 second entry
+iq2 first entry
+iq2 second entry
+EOF
+
+${PKGDIR}/bin/iqueue -f $IQ2 -b > $WORKDIR/iq2.txt
+cat <<EOF | diff - $WORKDIR/iq2.txt || die "iq2 failed comparison"
+iq2 first entry
+iq2 second entry
+iq1 first entry
+iq1 second entry
+EOF
+
+exit
+
+
+
+#
+# Now test a tailing case with sealing
+#
+for i in `seq 1 10`; do
+    echo "iq2 $i" | iqueue-append $IQ2
+done
+
+#set -x
+
+${PKGDIR}/bin/iqsync \
+    -f $IQ2 \
+    --verbose \
+    --tail \
+    --sleep 100 \
+    --report-interval 2 \
+    --pull \
+    localhost:$IQ1 \
+    &
+
+IQSYNC_PID=$!
+
+sleep 10
+for i in `seq 1 10`; do
+    echo "iq1 $i" | iqueue-append $IQ1
+done
+
+sleep 2
+warn "Sealing $IQ1"
+
+${PKGDIR}/bin/iqueue -f $IQ1 --seal \
+|| die "$IQ1: Unable to seal"
+
+sleep 2
+
+if kill $IQSYNC_PID 2>/dev/null; then
+    die "iqsync did not exit on its own"
+fi
+
+warn "Everything exited correctly.  Checking results"
+
+${PKGDIR}/bin/iqueue -f $IQ2 -b > $WORKDIR/iq2.txt
+cat <<EOF | diff - $WORKDIR/iq2.txt || die "iq2 failed comparison"
+iq2 first entry
+iq1 first entry
+iq2 1
+iq2 2
+iq2 3
+iq2 4
+iq2 5
+iq2 6
+iq2 7
+iq2 8
+iq2 9
+iq2 10
+iq1 1
+iq1 2
+iq1 3
+iq1 4
+iq1 5
+iq1 6
+iq1 7
+iq1 8
+iq1 9
+iq1 10
+EOF
+
+
+warn "sync ok"
+
+exit $ERROR

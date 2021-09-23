@@ -1,0 +1,218 @@
+#! /bin/bash
+#   Copyright 2021 Two Sigma Open Source, LLC
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+#
+# Test iqsync filters
+#
+
+# Global settings
+DIR=$(dirname $0)
+PROG=$(basename $0)
+PKGDIR=$(cd $(dirname ${0})/../..; pwd -L)
+
+# Populate the TS_*_HOME variables
+eval $($(${PKGDIR}/bin/gettools)/bin/buildpath -s -r ${PKGDIR})
+
+WORKDIR="$(mktemp -d -t $PROG.XXXXXXXXXX)"
+trap "rm -fr $WORKDIR" 0 1 2 3 15
+
+IQSYNC=${PKGDIR}/bin/iqsync
+IQUEUE=${PKGDIR}/bin/iqueue
+
+die() {
+    echo >&2 "$@"
+    exit 1
+}
+
+warn() {
+    echo >&2 "$@"
+}
+
+log() {
+    echo >&2 "--------- $@ -----------"
+}
+
+export IQSYNC_RSH=${PKGDIR}/sh/nop-ssh
+
+echo Using $WORKDIR
+SRC_IQ=$WORKDIR/src.iqx
+IQ1=$WORKDIR/iq1.iqx
+IQ2=$WORKDIR/iq2.iqx
+
+echo Header1 | $IQUEUE \
+    -f $SRC_IQ \
+    --create \
+    --header \
+|| die "$SRC_IQ: Unable to create"
+
+LEGACY_FILTER_SRC=${WORKDIR}/filter_legacy.c
+LEGACY_FILTER_LIB=${WORKDIR}/libfilter_legacy.so
+FILTER_SRC=$WORKDIR/filter.c
+FILTER_LIB=${WORKDIR}/libfilter.so
+
+for n in {1..100}; do echo "$n";done | $IQUEUE \
+    -f $SRC_IQ \
+    --line
+
+$IQUEUE \
+    -f $SRC_IQ \
+    > $WORKDIR/src.txt
+################
+# IQSync using legacy filter
+#
+log "creating legacy filter shared library"
+cat >$LEGACY_FILTER_SRC <<EOF
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef int (*filter_fn_t)(void *handle, const void *buf, size_t len);
+
+static int
+filter(void *handle, const void *buf, size_t len)
+{
+    int *index = handle;
+
+    if ((*index)++ % 2 == 0) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+int
+setup(
+    const void *iq_header,
+    size_t iq_hdr_len,
+    void **filter_priv_data,
+    filter_fn_t *filter_fn)
+{
+    int *index = calloc(1, sizeof(*index));
+
+    *filter_priv_data = index;
+    *filter_fn = filter;
+
+    return 0;
+}
+EOF
+
+gcc -o ${LEGACY_FILTER_LIB} -shared -fpic ${LEGACY_FILTER_SRC}
+
+export IQSYNC_CMD="${IQSYNC} --filter ${LEGACY_FILTER_LIB}:setup"
+
+log "iqsync src into iq1"
+$IQSYNC \
+    -f $IQ1 \
+    --clone \
+    --verbose \
+    --sleep 100 \
+    localhost:$SRC_IQ \
+    >> $WORKDIR/iqsync.1.log \
+    2>&1 \
+|| die "iqsync --clone -f src iq1"
+
+$IQUEUE \
+    -f $IQ1 \
+    > $WORKDIR/iq1.txt
+
+################
+# IQSync using filter
+#
+log "creating filter shared library"
+cat >$FILTER_SRC <<EOF
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "tsproperties.h"
+
+typedef int (*filter_fn_t)(void *handle, const void *buf, size_t len);
+
+typedef struct _filter_data
+{
+    int msg_index;
+
+    int id;
+    int total_len;
+} filter_data_t;
+
+static int
+filter(void *handle, const void *buf, size_t len)
+{
+    filter_data_t *data = handle;
+
+    if ((data->msg_index)++ % data->total_len == data->id) {
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+int
+setup(
+    const void *iq_header,
+    size_t iq_hdr_len,
+    void **filter_priv_data,
+    filter_fn_t *filter_fn,
+    tsproperties_t *props)
+{
+    filter_data_t *data = calloc(1, sizeof(*data));
+
+    data->id = atoi(tsproperties_get(props, "index"));
+    data->total_len = atoi(tsproperties_get(props, "total_len"));
+
+    *filter_priv_data = data;
+    *filter_fn = filter;
+
+    return 0;
+}
+EOF
+
+gcc -I${TS_LANG_C_BASE_HOME}/c/include -I${TS_LANG_C_UTIL_HOME}/c/include -o ${FILTER_LIB} -shared -fpic ${FILTER_SRC}
+
+export IQSYNC_CMD="${IQSYNC} --filter ${FILTER_LIB}:setup?index=0&total_len=2"
+
+log "iqsync src into iq2"
+$IQSYNC \
+    -f $IQ2 \
+    --clone \
+    --verbose \
+    --sleep 100 \
+    localhost:$SRC_IQ \
+    >> $WORKDIR/iqsync.2.log \
+    2>&1 \
+|| die "iqsync --clone -f src iq2"
+
+$IQUEUE \
+    -f $IQ2 \
+    > $WORKDIR/iq2.txt
+
+diff $WORKDIR/iq{1,2}.txt || die "filter dismatch"
+[ $(cat ${WORKDIR}/iq1.txt|wc -l) -eq 51 ] || die "filter failed"
+################
+# clean up
+#
+log "Waiting"
+sleep 1
+
+for iq in $SRC_IQ $IQ1 $IQ2; do
+    $PKGDIR/bin/iqueue \
+	-f $iq \
+	--stats \
+
+done
+
+pkill -P $$
+exit 0

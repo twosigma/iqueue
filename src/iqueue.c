@@ -1,23 +1,30 @@
-/*	$TwoSigma: iqueue.c,v 1.30 2012/01/05 21:45:21 thudson Exp $	*/
-
 /*
- *	Copyright (c) 2010 Two Sigma Investments, LLC
- *	All Rights Reserved
+ *    Copyright 2021 Two Sigma Open Source, LLC
  *
- *	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF
- *      Two Sigma Investments, LLC.
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
  *
- *	The copyright notice above does not evidence any
- *	actual or intended publication of such source code.
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
  */
 
 #include "twosigma.h"
+#include <errno.h>
+#include <limits.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
 #include <unistd.h>
+#include <stdatomic.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -28,29 +35,25 @@
 #include <xmmintrin.h>
 #include <semaphore.h>
 #include <pthread.h>
-#include "tsutil.h"
+#include "tslog.h"
 #include "tsclock.h"
 #include "iqueue.h"
 #include "iqsync.h"
-#include "atomic.h"
-#include "tslock.h"
 #include "shash.h"
+#include <assert.h>
 
-__RCSID("$TwoSigma: iqueue.c,v 1.30 2012/01/05 21:45:21 thudson Exp $");
+#define IQUEUE_INDEX_MAGIC      ((uint32_t) 0xDADA1234)
+#define IQUEUE_VERSION          ((uint32_t) 0x00003000)
+#define IQUEUE_BLOCK_MAGIC      ((uint64_t) 0x6971626c6f636b00)
+#define IQUEUE_MAX_HDR_LEN      ((size_t) 4096)
 
+#define IQUEUE_TABLE_SHIFT      20
+#define IQUEUE_TABLE_MASK       ((1 << IQUEUE_TABLE_SHIFT) - 1)
+#define IQUEUE_TABLE_SIZE       (1 << 20)
 
-#define IQUEUE_INDEX_MAGIC	((uint32_t) 0xDADA1234)
-#define IQUEUE_VERSION		((uint32_t) 0x00003000)
-#define IQUEUE_BLOCK_MAGIC	((uint64_t) 0x6971626c6f636b00)
-#define IQUEUE_MAX_HDR_LEN	((size_t) 4096)
+#define IQUEUE_WRITER_TABLES    4
 
-#define IQUEUE_TABLE_SHIFT	20
-#define IQUEUE_TABLE_MASK	((1 << IQUEUE_TABLE_SHIFT) - 1)
-#define IQUEUE_TABLE_SIZE	(1 << 20)
-
-#define IQUEUE_WRITER_TABLES	4
-
-#define IQUEUE_BLOCK_COUNT	(1024)
+#define IQUEUE_BLOCK_COUNT      (1024)
 
 
 typedef struct
@@ -63,7 +66,7 @@ typedef struct
     // pointers to/size of the writer tables.  Must be at least
     // 8-byte aligned to ensure that it does not cross a cache line.
     const iqueue_msg_t writer_tables[IQUEUE_WRITER_TABLES]
-	__attribute__((aligned(8)));
+        __attribute__((aligned(8)));
 
     volatile iqueue_id_t index_tail __attribute__((aligned(64)));
     volatile uint64_t data_tail __attribute__((aligned(64)));
@@ -141,7 +144,7 @@ _iqueue_flock(
 )
 {
     if (iq->last_grow_size == 0)
-	return 1;
+        return 1;
 
     iqueue_index_t * const idx = iq->idx;
 
@@ -149,52 +152,54 @@ _iqueue_flock(
     // the process that has it locked, in which case we can then check
     // the flock time field.
     if (flock(iq->fd, LOCK_EX) < 0)
-	return -1;
+        return -1;
 
     // Check to see the file lock time
     uint64_t now = tsclock_getnanos(0);
-    uint64_t old_flock_time = atomic_cas_64(&idx->flock_time, 0, now);
+    uint64_t const zero = 0;
 
     // If there was no file lock time set, and we wrote our time to it,
     // then we have the locks and are ready to proceed.
-    if (old_flock_time == 0)
-	return now;
+    if (atomic_compare_exchange_strong(&idx->flock_time, &zero, now))
+        return now;
 
-    TSLOGX(TSINFO, "%s: lock held since %"PRIu64" (now=%"PRIu64")",
-	iq->name,
-	old_flock_time,
-	now
+    uint64_t old_flock_time = idx->flock_time;
+
+    TSLOGXL(TSINFO, "%s: lock held since %"PRIu64" (now=%"PRIu64")",
+        iq->name,
+        old_flock_time,
+        now
     );
 
     // Spin for up to 1 msec or until the flock_time changes.
     const uint64_t flock_timeout = 1000000;
     while (now < old_flock_time + flock_timeout)
     {
-	// If it changes, that means that another thread in our process
-	// has finished its business and the lock conditions should be
-	// rechecked to see if it even matters any more.
-	if (idx->flock_time != old_flock_time)
-	{
-	    flock(iq->fd, LOCK_UN);
-	    TSLOGX(TSDEBUG, "%s: Lock is available again", iq->name);
-	    return 0;
-	}
+        // If it changes, that means that another thread in our process
+        // has finished its business and the lock conditions should be
+        // rechecked to see if it even matters any more.
+        if (idx->flock_time != old_flock_time)
+        {
+            flock(iq->fd, LOCK_UN);
+            TSLOGXL(TSDEBUG, "%s: Lock is available again", iq->name);
+            return 0;
+        }
 
-	usleep(10);
-	now = tsclock_getnanos(0);
+        usleep(10);
+        now = tsclock_getnanos(0);
     }
 
     // Someone else has held the lock for more than our timeout,
     // which means they are likely dead.  Steal the lock from
     // them if we can.
-    if (atomic_cas_bool_64(&idx->flock_time, old_flock_time, now))
+    if (atomic_compare_exchange_strong(&idx->flock_time, &old_flock_time, now))
     {
-	TSLOGX(TSWARN, "%s: Stole lock after timeout", iq->name);
-	return now;
+        TSLOGXL(TSWARN, "%s: Stole lock after timeout", iq->name);
+        return now;
     }
 
     flock(iq->fd, LOCK_UN);
-    TSLOGX(TSDEBUG, "%s: Lock is available again", iq->name);
+    TSLOGXL(TSDEBUG, "%s: Lock is available again", iq->name);
     return 0;
 }
 
@@ -206,10 +211,10 @@ _iqueue_funlock(
 )
 {
     if (iq->last_grow_size == 0)
-	return;
+        return;
 
-    if (!atomic_cas_bool_64(&iq->idx->flock_time, lock_time, 0))
-	TSLOGX(TSWARN, "%s: Lock was stolen from us!  Danger!", iq->name);
+    if (!atomic_compare_exchange_strong(&iq->idx->flock_time, &lock_time, 0))
+        TSLOGXL(TSWARN, "%s: Lock was stolen from us!  Danger!", iq->name);
 
     flock(iq->fd, LOCK_UN);
 }
@@ -233,57 +238,57 @@ iqueue_grow_file(
     struct stat sb;
 retry:
     if (fstat(iq->fd, &sb) < 0)
-	goto fail;
+        goto fail;
 
     // Once we (or someone) have been successful in growing the file,
     // we're done and can return.
     if (sb.st_size >= (off_t) new_size)
     {
-	TSLOGX(TSDEBUG, "%s: File is already %"PRIu64" bytes >= %"PRIu64,
-	    iq->name,
-	    (uint64_t) sb.st_size,
-	    new_size
-	);
-	return 0;
+        TSLOGXL(TSDEBUG, "%s: File is already %"PRIu64" bytes >= %"PRIu64,
+            iq->name,
+            (uint64_t) sb.st_size,
+            new_size
+        );
+        return 0;
     }
 
     // For the first block, we can't lock since the file doesn't exist.
     const uint64_t flock_time = _iqueue_flock(iq);
     if (flock_time == (uint64_t) -1)
-	goto fail;
+        goto fail;
     if (flock_time == 0)
-	goto retry;
+        goto retry;
 
     // Double check the file size, just in case
     // in between us checking the size and then getting the lock,
     // someone else has grown the file.
     if (fstat(iq->fd, &sb) < 0)
     {
-	_iqueue_funlock(iq, flock_time);
-	goto fail;
+        _iqueue_funlock(iq, flock_time);
+        goto fail;
     }
 
     if (sb.st_size >= (off_t) new_size)
     {
-	_iqueue_funlock(iq, flock_time);
-	TSLOGX(TSDEBUG, "%s: Someone else grew the file to %"PRIu64,
-	    iq->name,
-	    new_size
-	);
-	return 0;
+        _iqueue_funlock(iq, flock_time);
+        TSLOGXL(TSDEBUG, "%s: Someone else grew the file to %"PRIu64,
+            iq->name,
+            new_size
+        );
+        return 0;
     }
 
 
-    TSLOGX(TSINFO, "%s: Growing from 0x%"PRIx64" to 0x%"PRIx64" bytes",
-	iq->name,
-	(uint64_t) sb.st_size,
-	new_size
+    TSLOGXL(TSDEBUG, "%s: Growing from 0x%"PRIx64" to 0x%"PRIx64" bytes",
+        iq->name,
+        (uint64_t) sb.st_size,
+        new_size
     );
 
     if (ftruncate(iq->fd, new_size) < 0)
     {
-	_iqueue_funlock(iq, flock_time);
-	goto fail;
+        _iqueue_funlock(iq, flock_time);
+        goto fail;
     }
 
     _iqueue_funlock(iq, flock_time);
@@ -291,9 +296,9 @@ retry:
     return 0;
 
 fail:
-    TSLOG(TSERROR, "%s: Failed to grow to %"PRIu64" bytes",
-	iq->name,
-	new_size
+    TSLOGL(TSERROR, "%s: Failed to grow to %"PRIu64" bytes",
+        iq->name,
+        new_size
     );
 
     return -1;
@@ -309,22 +314,22 @@ iqueue_mlock_block(
 {
     if (block_id >= IQUEUE_BLOCK_COUNT)
     {
-	TSLOGX(TSWARN, "%s: Block %"PRIu64" out of range", iq->name, block_id);
-	return -1;
+        TSLOGXL(TSWARN, "%s: Block %"PRIu64" out of range", iq->name, block_id);
+        return -1;
     }
 
     void * const block = iq->blocks[block_id];
     if (!block)
-	return 0;
+        return 0;
 
     if (mlock(block, IQUEUE_BLOCK_SIZE) == 0)
-	return 0;
+        return 0;
 
-    TSLOG(TSWARN, "%s: Unable to mlock(block[%"PRIu64"]=%p,0x%"PRIx64")",
-	iq->name,
-	block_id,
-	block,
-	IQUEUE_BLOCK_SIZE
+    TSLOGL(TSWARN, "%s: Unable to mlock(block[%"PRIu64"]=%p,0x%"PRIx64")",
+        iq->name,
+        block_id,
+        block,
+        IQUEUE_BLOCK_SIZE
     );
 
     iq->mlock_flag = 0;
@@ -343,43 +348,43 @@ iqueue_fsync_block(
 {
     if (block_id >= IQUEUE_BLOCK_COUNT)
     {
-	TSLOGX(TSWARN, "%s: Block %"PRIu64" out of range", iq->name, block_id);
-	return -1;
+        TSLOGXL(TSWARN, "%s: Block %"PRIu64" out of range", iq->name, block_id);
+        return -1;
     }
 
     void * const block = iq->blocks[block_id];
     if (!block)
-	return -1;
+        return -1;
 
     const uint64_t block_offset = block_id << IQUEUE_BLOCK_SHIFT;
 
     // First sync contents of block to ensure any dirty pages in our mapping
     // are saved back to the file
     if (sync_file_range(
-	    iq->fd,
-	    block_offset,
-	    IQUEUE_BLOCK_SIZE,
-	    SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE) != 0) {
-	TSLOG(TSWARN, "%s: Unable to fsync(block[%"PRIu64"]=%p,0x%"PRIx64")",
-	    iq->name,
-	    block_id,
-	    block,
-	    IQUEUE_BLOCK_SIZE
-	);
-	return -1;
+            iq->fd,
+            block_offset,
+            IQUEUE_BLOCK_SIZE,
+            SYNC_FILE_RANGE_WAIT_BEFORE | SYNC_FILE_RANGE_WRITE) != 0) {
+        TSLOGL(TSWARN, "%s: Unable to fsync(block[%"PRIu64"]=%p,0x%"PRIx64")",
+            iq->name,
+            block_id,
+            block,
+            IQUEUE_BLOCK_SIZE
+        );
+        return -1;
     }
 
     // Now free the VMAs so Linux will reclaim teh pages (unless we access
     // it again)
     if (madvise(block, IQUEUE_BLOCK_SIZE, MADV_DONTNEED) != 0) {
-	TSLOG(TSWARN, "%s: Unable to madvise(block[%"PRIu64"]=%p,0x%"PRIx64
-		", MADV_DONTNEED)",
-	    iq->name,
-	    block_id,
-	    block,
-	    IQUEUE_BLOCK_SIZE
-	);
-	return -1;
+        TSLOGL(TSWARN, "%s: Unable to madvise(block[%"PRIu64"]=%p,0x%"PRIx64
+                ", MADV_DONTNEED)",
+            iq->name,
+            block_id,
+            block,
+            IQUEUE_BLOCK_SIZE
+        );
+        return -1;
     }
 
     return 0;
@@ -401,19 +406,19 @@ _iqueue_map_block(
 {
     // If we do not have a file, we can not do any mappings
     if (iq->fd < 0)
-	return NULL;
+        return NULL;
 
     // Make sure the file is at least as large as this block size
     const uint64_t min_size = (block_id + 2) << IQUEUE_BLOCK_SHIFT;
     if (iqueue_grow_file(iq, min_size) < 0)
-	return NULL;
+        return NULL;
 
     // Quick check to see if any one else has already done so
     uint8_t * block = iq->blocks[block_id];
     if (block)
     {
-	TSLOGX(TSDEBUG, "%s: block %"PRIu64" already mapped to %p", iq->name, block_id, block);
-	return block;
+        TSLOGXL(TSDEBUG, "%s: block %"PRIu64" already mapped to %p", iq->name, block_id, block);
+        return block;
     }
 
     // Attempt to map it
@@ -421,46 +426,47 @@ _iqueue_map_block(
     uint64_t map_time = -tsclock_getnanos(0);
 
     block = mmap(
-	NULL,
-	IQUEUE_BLOCK_SIZE,
-	iq->mmap_prot,
-	iq->mmap_flags,
-	iq->fd,
-	block_offset
+        NULL,
+        IQUEUE_BLOCK_SIZE,
+        iq->mmap_prot,
+        iq->mmap_flags,
+        iq->fd,
+        block_offset
     );
     if (block == MAP_FAILED)
     {
-	TSLOGX(TSERROR, "%s: Failed to map offset %"PRIu64, iq->name, block_offset);
-	return NULL;
+        TSLOGXL(TSERROR, "%s: Failed to map offset %"PRIu64, iq->name, block_offset);
+        return NULL;
     }
 
     map_time += tsclock_getnanos(0);
 
     // Attempt to write the mapping into the local block table
-    if (!atomic_cas_bool_ptr((volatile void*) &iq->blocks[block_id], NULL, block))
+    uint8_t *const null = NULL;
+    if (!atomic_compare_exchange_strong(&iq->blocks[block_id], &null, block))
     {
-	// We lost!  Someone else beat us to it.  Deallocate our block
-	// and use theirs instead.  Sucks to be us.
-	TSLOGX(TSDEBUG,
-	    "%s: Lost race.  Unmapping %"PRIx64" from %p",
-	    iq->name,
-	    block_offset,
-	    block
-	);
+        // We lost!  Someone else beat us to it.  Deallocate our block
+        // and use theirs instead.  Sucks to be us.
+        TSLOGXL(TSDEBUG,
+            "%s: Lost race.  Unmapping %"PRIx64" from %p",
+            iq->name,
+            block_offset,
+            block
+        );
 
-	munmap(block, IQUEUE_BLOCK_SIZE);
-	return iq->blocks[block_id];
+        munmap(block, IQUEUE_BLOCK_SIZE);
+        return iq->blocks[block_id];
     }
 
-    TSLOGX(TSINFO, "%s: Mapped 0x%"PRIx64" to %p in %"PRIu64" ns",
-	iq->name,
-	block_offset,
-	block,
-	map_time
+    TSLOGXL(TSDEBUG, "%s: Mapped 0x%"PRIx64" to %p in %"PRIu64" ns",
+        iq->name,
+        block_offset,
+        block,
+        map_time
     );
 
     if (iq->mlock_flag)
-	iqueue_mlock_block(iq, block_id);
+        iqueue_mlock_block(iq, block_id);
 
     posix_madvise(block, IQUEUE_BLOCK_SIZE, POSIX_MADV_SEQUENTIAL);
 
@@ -484,43 +490,43 @@ _iqueue_unmap(
 {
     if (iq->prefetch_thread)
     {
-	TSLOGX(TSINFO, "%s: Shutdown prefetch thread", iq->name);
-	pthread_cancel(iq->prefetch_thread);
-	pthread_join(iq->prefetch_thread, NULL);
-	iq->prefetch_thread = 0;
+        TSLOGXL(TSINFO, "%s: Shutdown prefetch thread", iq->name);
+        pthread_cancel(iq->prefetch_thread);
+        pthread_join(iq->prefetch_thread, NULL);
+        iq->prefetch_thread = 0;
     }
 
     if (iq->syncbehind_thread)
     {
-	TSLOGX(TSINFO, "%s: Shutdown syncbehind thread", iq->name);
-	pthread_cancel(iq->syncbehind_thread);
-	pthread_join(iq->syncbehind_thread, NULL);
-	iq->syncbehind_thread = 0;
+        TSLOGXL(TSINFO, "%s: Shutdown syncbehind thread", iq->name);
+        pthread_cancel(iq->syncbehind_thread);
+        pthread_join(iq->syncbehind_thread, NULL);
+        iq->syncbehind_thread = 0;
     }
 
     if (iq->fd >= 0)
     {
-	close(iq->fd);
-	iq->fd = -1;
+        close(iq->fd);
+        iq->fd = -1;
     }
 
     // Don't unmap idx if it was shared with iq->blocks[0]
     if ((void*) iq->idx != iq->blocks[0] && iq->idx)
     {
-	TSLOGX(TSDEBUG, "%s: Unmapping idx %p", iq->name, iq->idx);
-	munmap(iq->idx, IQUEUE_BLOCK_SIZE);
+        TSLOGXL(TSDEBUG, "%s: Unmapping idx %p", iq->name, iq->idx);
+        munmap(iq->idx, IQUEUE_BLOCK_SIZE);
     }
 
     iq->idx = NULL;
 
     for (unsigned i = 0 ; i < IQUEUE_BLOCK_COUNT ; i++)
     {
-	if (!iq->blocks[i])
-	    continue;
+        if (!iq->blocks[i])
+            continue;
 
-	TSLOGX(TSDEBUG, "%s: Unmapping block %u: %p", iq->name, i, iq->blocks[i]);
-	munmap(iq->blocks[i], IQUEUE_BLOCK_SIZE);
-	iq->blocks[i] = NULL;
+        TSLOGXL(TSDEBUG, "%s: Unmapping block %u: %p", iq->name, i, iq->blocks[i]);
+        munmap(iq->blocks[i], IQUEUE_BLOCK_SIZE);
+        iq->blocks[i] = NULL;
     }
 
     // Trash the cached table lookup so that we won't use it
@@ -540,31 +546,30 @@ _iqueue_reopen(
     int serrno;
 
     if (iq->fd >= 0)
-	_iqueue_unmap(iq);
+        _iqueue_unmap(iq);
 
     const int open_flags = iq->open_flags | (create_flag ? O_CREAT : 0);
     const char * const open_str =
-	open_flags == O_RDONLY ? "readonly" :
-	open_flags == O_RDWR ? "readwrite" :
-	"create";
+        open_flags == O_RDONLY ? "readonly" :
+        open_flags == O_RDWR ? "readwrite" :
+        "create";
 
     iq->fd = open(
-	iq->name,
-	open_flags,
-	iq->open_mode
+        iq->name,
+        open_flags,
+        iq->open_mode
     );
     if (iq->fd < 0)
     {
-	if (errno == ENOENT)
-	{
-	    TSLOGX(TSWARN, "%s: No such file or directory", iq->name);
-	    sleep(1); // force a short wait
-	    errno = ENOENT;
-	    return -1;
-	}
+        if (errno == ENOENT)
+        {
+            TSLOGXL(TSWARN, "%s: No such file or directory", iq->name);
+            errno = ENOENT;
+            return -1;
+        }
 
-	TSLOGX(TSERROR, "%s: Unable to open %s", iq->name, open_str);
-	goto fail;
+        TSLOGXL(TSERROR, "%s: Unable to open %s", iq->name, open_str);
+        goto fail;
     }
 
     // If we are creating the iqueue for the first time we are allowed
@@ -572,26 +577,26 @@ _iqueue_reopen(
     // temporary file.
     if (create_flag)
     {
-	iq->idx = _iqueue_map_block(iq, 0);
-	if (iq->idx == NULL)
-	    goto fail;
-	return 0;
+        iq->idx = _iqueue_map_block(iq, 0);
+        if (iq->idx == NULL)
+            goto fail;
+        return 0;
     }
 
     // We can't use _iqueue_map_block() since that might modify an existing
     // file.  Instead we have to just map a minimal segment at first
     void * block = mmap(
-	NULL,
-	IQUEUE_BLOCK_SIZE,
-	iq->mmap_prot,
-	iq->mmap_flags,
-	iq->fd,
-	0
+        NULL,
+        IQUEUE_BLOCK_SIZE,
+        iq->mmap_prot,
+        iq->mmap_flags,
+        iq->fd,
+        0
     );
     if (block == MAP_FAILED)
     {
-	TSLOG(TSERROR, "%s: Failed to map index header", iq->name);
-	goto fail;
+        TSLOGL(TSERROR, "%s: Failed to map index header", iq->name);
+        goto fail;
     }
 
     iq->idx = block;
@@ -600,16 +605,16 @@ _iqueue_reopen(
     struct stat sb;
     if (fstat(iq->fd, &sb) < 0)
     {
-	TSLOG(TSERROR, "%s: Failed to stat", iq->name);
-	goto fail;
+        TSLOGL(TSERROR, "%s: Failed to stat", iq->name);
+        goto fail;
     }
 
     const uint64_t file_size = sb.st_size;
 
     if ((size_t) file_size < sizeof(*iq->idx))
     {
-	TSLOGX(TSWARN, "%s: File is much too small.  Not an iqx?", iq->name);
-	goto fail;
+        TSLOGXL(TSWARN, "%s: File is much too small.  Not an iqx?", iq->name);
+        goto fail;
     }
 
 
@@ -617,27 +622,27 @@ _iqueue_reopen(
     if (iq->idx->magic != IQUEUE_INDEX_MAGIC
     ||  iq->idx->version != IQUEUE_VERSION)
     {
-	TSLOGX(TSERROR,
-	    "%s: Magic %"PRIx32".%"PRIx32" != expected %"PRIx32".%"PRIx32,
-	    iq->name,
-	    iq->idx->magic,
-	    iq->idx->version,
-	    IQUEUE_INDEX_MAGIC,
-	    IQUEUE_VERSION
-	);
-	goto fail;
+        TSLOGXL(TSERROR,
+            "%s: Magic %"PRIx32".%"PRIx32" != expected %"PRIx32".%"PRIx32,
+            iq->name,
+            iq->idx->magic,
+            iq->idx->version,
+            IQUEUE_INDEX_MAGIC,
+            IQUEUE_VERSION
+        );
+        goto fail;
     }
 
     // Everything looks ok so far.
-    TSLOGX(TSDEBUG,
-	"%s: %s: creation %"PRIu64", entries %"PRIu64", data %"PRIu64", size %"PRIu64" %s",
-	iq->name,
-	open_str,
-	iq->idx->creation_time,
-	iq->idx->index_tail,
-	iq->idx->data_tail,
-	file_size,
-	iqueue_is_sealed(iq) ? ", sealed" : ""
+    TSLOGXL(TSDEBUG,
+        "%s: %s: creation %"PRIu64", entries %"PRIu64", data %"PRIu64", size %"PRIu64" %s",
+        iq->name,
+        open_str,
+        iq->idx->creation_time,
+        iq->idx->index_tail,
+        iq->idx->data_tail,
+        file_size,
+        iqueue_is_sealed(iq) ? ", sealed" : ""
     );
 
     iq->last_grow_size = file_size;
@@ -669,7 +674,7 @@ _iqueue_init(
 {
     iqueue_t * const iq = calloc(1, sizeof(*iq));
     if (!iq)
-	goto fail_iqueue_malloc;
+        goto fail_iqueue_malloc;
 
     int open_flags = O_RDONLY;
     int open_mode = 0444;
@@ -678,25 +683,25 @@ _iqueue_init(
 
     if (create_flag >= 0)
     {
-	open_flags = O_RDWR;
-	open_mode |= 0222;
-	mmap_prot |= PROT_WRITE;
+        open_flags = O_RDWR;
+        open_mode |= 0222;
+        mmap_prot |= PROT_WRITE;
     }
 
     memcpy(iq, &(iqueue_t) {
-	.fd		= -1,
-	.table_cache	= -1,
-	.name		= filename,
-	.open_flags	= open_flags,
-	.open_mode	= open_mode,
-	.mmap_prot	= mmap_prot,
-	.mmap_flags	= mmap_flags,
+        .fd             = -1,
+        .table_cache    = -1,
+        .name           = filename,
+        .open_flags     = open_flags,
+        .open_mode      = open_mode,
+        .mmap_prot      = mmap_prot,
+        .mmap_flags     = mmap_flags,
     }, sizeof(*iq));
 
     sem_init(&iq->prefetch_sem, 0, 0);
 
     if (_iqueue_reopen(iq, create_flag == 1) < 0)
-	goto fail_reopen;
+        goto fail_reopen;
 
     return iq;
 
@@ -716,16 +721,33 @@ iqueue_open(
 {
     char * const filename = strdup(index_filename);
     if (!filename)
-	return NULL;
+        return NULL;
 
     iqueue_t * const iq = _iqueue_init(filename, writeable ? 0 : -1);
     if (!iq)
-	return NULL;
+        return NULL;
 
     if (writeable)
-	iqueue_prefetch(iq, 0, 16 << 20);
+        iqueue_prefetch(iq, 0, 16 << 20);
 
     return iq;
+}
+
+
+int
+iqueue_update_creation_time(
+    iqueue_t * iq,
+    uint64_t creation_time
+)
+{
+    if (iq->open_flags != O_RDWR) {
+	TSLOGX(TSERROR, "iqueue is not writable");
+        return -1;
+    }
+    uint64_t *creation_time_ptr = __UNCONST_T(uint64_t *, &iq->idx->creation_time);
+    *creation_time_ptr = creation_time;
+
+    return 0;
 }
 
 
@@ -738,69 +760,117 @@ iqueue_create(
 )
 {
     if (creation == 0)
-	creation = tsclock_getnanos(0);
+        creation = tsclock_getnanos(0);
 
-    if (hdr_len > IQUEUE_MAX_HDR_LEN)
+    // If the argument is a symlink, resolve it and work on the destination.
+    static_assert(PATH_MAX > 0, "PATH_MAX is not defined as a positive value, need to replace PATH_MAX");
+    if (strlen(index_filename) > PATH_MAX)
     {
-	TSLOGX(TSERROR, "%s: Header len %zu > max %zu",
-	    index_filename,
-	    hdr_len,
-	    IQUEUE_MAX_HDR_LEN
-	);
-
+	TSLOGX(TSERROR, "%s: Iqueue path longer than PATH_MAX(%d)", index_filename, PATH_MAX);
 	return NULL;
     }
 
-    const int namelen = strlen(index_filename);
+    char index_resolved[PATH_MAX+1];
+    char index_buffer[PATH_MAX+1];
+    strcpy(index_resolved, index_filename);
+
+    ssize_t resolved_len = 0;
+    size_t symlink_hops = 0;
+    while (1)
+    {
+	resolved_len = readlink(index_resolved, index_buffer, PATH_MAX);
+	int readlink_errno = errno;
+	if (resolved_len == -1 && (readlink_errno == EINVAL || readlink_errno == ENOENT))
+	{
+	    // Found a path that either is not a symlink or doesn't exist yet.
+	    break;
+	}
+	else if (resolved_len == -1)
+	{
+	    TSLOGX(TSERROR, "%s: Could not resolve real path (broken at: %s, reason: %s)",
+		index_filename, index_resolved, strerror(readlink_errno));
+	    return NULL;
+	}
+	else if (resolved_len == PATH_MAX)
+	{
+	    TSLOGX(TSERROR, "%s: Could not resolve real path (path too long: %s, max %d)",
+		    index_filename, index_resolved, PATH_MAX);
+	    return NULL;
+	}
+	memcpy(index_resolved, index_buffer, resolved_len);
+	index_resolved[resolved_len] = '\0';
+
+	++symlink_hops;
+	if (symlink_hops > _SC_SYMLOOP_MAX) {
+	    TSLOGX(TSERROR, "%s: Could not resolve real path (in a loop: stoppped at %s, symlink hops: %zu)",
+		index_filename, index_resolved, symlink_hops);
+	    return NULL;
+	}
+    }
+    TSLOGX(TSINFO, "%s: Will use resolved path: %s", index_filename, index_resolved);
+
+    if (hdr_len > IQUEUE_MAX_HDR_LEN)
+    {
+        TSLOGXL(TSERROR, "%s (%s): Header len %zu > max %zu",
+            index_filename,
+	    index_resolved,
+            hdr_len,
+            IQUEUE_MAX_HDR_LEN
+        );
+
+        return NULL;
+    }
+
+    const int namelen = strlen(index_resolved);
     char * filename = calloc(1, namelen + 32);
     if (!filename)
-	goto fail_filename_alloc;
-    snprintf(filename, namelen+32, "%s.%"PRIx64, index_filename, creation);
+        goto fail_filename_alloc;
+    snprintf(filename, namelen+32, "%s.%"PRIx64, index_resolved, creation);
 
     iqueue_t * const iq = _iqueue_init(filename, 1);
     if (!iq)
-	goto fail_iq_alloc;
+        goto fail_iq_alloc;
 
     // Fill in the required fields and user header
     memcpy(iq->idx, &(iqueue_index_t) {
-	.magic		= IQUEUE_INDEX_MAGIC,
-	.version	= IQUEUE_VERSION,
-	.creation_time  = creation,
-	.hdr_len	= hdr_len,
-	.index_tail	= 0,
-	.data_tail	= sizeof(*iq->idx)
-			+ IQUEUE_TABLE_SIZE * sizeof(*iq->idx->tables),
+        .magic          = IQUEUE_INDEX_MAGIC,
+        .version        = IQUEUE_VERSION,
+        .creation_time  = creation,
+        .hdr_len        = hdr_len,
+        .index_tail     = 0,
+        .data_tail      = sizeof(*iq->idx)
+                        + IQUEUE_TABLE_SIZE * sizeof(*iq->idx->tables),
     }, sizeof(*iq->idx));
 
     memcpy(iq->idx->hdr, hdr, hdr_len);
 
     // The file is fully built on disk.  Attempt to atomically swap it for
     // the real one.
-    if (link(filename, index_filename) == -1)
+    if (link(filename, index_resolved) == -1)
     {
-	if (errno != EEXIST)
-	{
-	    TSLOG(TSERROR, "%s: Unable to link from %s", index_filename, filename);
-	    goto fail_link;
-	}
+        if (errno != EEXIST)
+        {
+            TSLOGL(TSERROR, "%s (%s): Unable to link from %s", index_filename, index_resolved, filename);
+            goto fail_link;
+        }
 
-	// Remove our temp file, and trailing creation time
-	unlink(filename);
-	filename[namelen] = '\0';
+        // Remove our temp file, and trailing creation time
+        unlink(filename);
+        filename[namelen] = '\0';
 
-	// Clean up and try to open it as a normal
-	// iqueue.  The caller will know that they lost the race since
-	// the creation time will not be the same as the one they specified
-	// \note: Do not goto the failure path since we do not want to unlink
-	// the actual iqueue file.
-	TSLOGX(TSINFO, "%s: Lost creation race.  Retrying", index_filename);
-	if (_iqueue_reopen(iq, 0) < 0)
-	{
-	    iqueue_close(iq);
-	    return NULL;
-	}
+        // Clean up and try to open it as a normal
+        // iqueue.  The caller will know that they lost the race since
+        // the creation time will not be the same as the one they specified
+        // \note: Do not goto the failure path since we do not want to unlink
+        // the actual iqueue file.
+        TSLOGXL(TSINFO, "%s (%s): Lost creation race.  Retrying", index_filename, index_resolved);
+        if (_iqueue_reopen(iq, 0) < 0)
+        {
+            iqueue_close(iq);
+            return NULL;
+        }
 
-	return iq;
+        return iq;
     }
 
     // We won the race.  Unlink our temp file, update our name and keep going
@@ -855,16 +925,16 @@ iqueue_archive(
     // Attempt to seal the iqueue at this id if one is provided
     if (seal_id != IQUEUE_MSG_BAD_ID)
     {
-	int rc = iqueue_try_seal(iq, seal_id);
-	if (rc != 0)
-	{
-	    TSLOGX(TSDEBUG, "%s: Failed to seal at id %"PRIu64": rc=%d",
-		iq->name,
-		seal_id,
-		rc
-	    );
-	    return rc;
-	}
+        int rc = iqueue_try_seal(iq, seal_id);
+        if (rc != 0)
+        {
+            TSLOGXL(TSDEBUG, "%s: Failed to seal at id %"PRIu64": rc=%d",
+                iq->name,
+                seal_id,
+                rc
+            );
+            return rc;
+        }
     }
 
     // We have successfully sealed the iqueue (or are not doing so)
@@ -872,34 +942,34 @@ iqueue_archive(
     const size_t namelen = strlen(old_name) + 32;
     char * new_name = calloc(1, namelen);
     if (!new_name)
-	return -1;
+        return -1;
 
     snprintf(new_name, namelen,
-	"%s.%"PRIu64,
-	old_name,
-	iqueue_creation(iq)
+        "%s.%"PRIu64,
+        old_name,
+        iqueue_creation(iq)
     );
 
     if (!iqueue_is_sealed(iq))
-	TSLOGX(TSWARN, "%s: Archiving an unsealed iqueue", old_name);
+        TSLOGXL(TSWARN, "%s: Archiving an unsealed iqueue", old_name);
 
     if (link(old_name, new_name) == -1)
     {
-	TSLOG(TSERROR, "%s: Unable to create link to archive %s",
-	    old_name,
-	    new_name
-	);
-	return -1;
+        TSLOGL(TSERROR, "%s: Unable to create link to archive %s",
+            old_name,
+            new_name
+        );
+        return -1;
     }
 
     if (unlink(old_name) == -1)
     {
-	TSLOG(TSERROR, "%s: Unable to unlink", old_name);
-	unlink(new_name);
-	return -1;
+        TSLOGL(TSERROR, "%s: Unable to unlink", old_name);
+        unlink(new_name);
+        return -1;
     }
 
-    TSLOGX(TSDEBUG, "%s: Archived to %s", iq->name, new_name);
+    TSLOGXL(TSDEBUG, "%s: Archived to %s", iq->name, new_name);
 
     return 0;
 }
@@ -915,25 +985,25 @@ iqueue_entries(
 
     while (1)
     {
-	switch (iqueue_status(iq, tail))
-	{
-	case IQUEUE_STATUS_HAS_DATA:
-	    // There are still entries out there.  Try the next one
-	    tail++;
-	    continue;
+        switch (iqueue_status(iq, tail))
+        {
+        case IQUEUE_STATUS_HAS_DATA:
+            // There are still entries out there.  Try the next one
+            tail++;
+            continue;
 
-	case IQUEUE_STATUS_NO_DATA:
-	    // We have found the end.
-	    return tail;
+        case IQUEUE_STATUS_NO_DATA:
+            // We have found the end.
+            return tail;
 
-	case IQUEUE_STATUS_SEALED:
-	    // We are one past the actual end of data
-	    return tail - 1;
+        case IQUEUE_STATUS_SEALED:
+            // We are one past the actual end of data
+            return tail - 1;
 
-	default:
-	    // Something is very wrong
-	    return (uint64_t) -1;
-	}
+        default:
+            // Something is very wrong
+            return (uint64_t) -1;
+        }
     }
 }
 
@@ -986,8 +1056,8 @@ iqueue_mlock(
 
     for (unsigned block_id = 0 ; block_id < IQUEUE_BLOCK_COUNT ; block_id++)
     {
-	if (iqueue_mlock_block(iq, block_id) == -1)
-	    return -1;
+        if (iqueue_mlock_block(iq, block_id) == -1)
+            return -1;
     }
 
     return 0;
@@ -1010,18 +1080,18 @@ iqueue_get_data(
     offset &= IQUEUE_BLOCK_MASK;
 
     if (unlikely(block_id >= IQUEUE_BLOCK_COUNT))
-	return NULL;
+        return NULL;
 
     uint8_t * block = iq->blocks[block_id];
     if (unlikely(block == NULL))
     {
-	if (!do_map)
-	    return NULL;
+        if (!do_map)
+            return NULL;
 
-	// They want it mapped.
-	block = _iqueue_map_block(iq, block_id);
-	if (!block)
-	    return NULL;
+        // They want it mapped.
+        block = _iqueue_map_block(iq, block_id);
+        if (!block)
+            return NULL;
     }
 
     return block + offset;
@@ -1036,13 +1106,13 @@ iqueue_allocate_raw(
 )
 {
     if (unlikely(!offset_out || len >= IQUEUE_BLOCK_SIZE))
-	return NULL;
+        return NULL;
     if (unlikely((iq->mmap_prot & PROT_WRITE) == 0))
     {
-	if (!iq->warned_readonly_allocate)
-	    TSLOGX(TSWARN, "%s: Attempt to allocate from read-only iqueue", iq->name);
-	iq->warned_readonly_allocate = 1;
-	return NULL;
+        if (!iq->warned_readonly_allocate)
+            TSLOGXL(TSWARN, "%s: Attempt to allocate from read-only iqueue", iq->name);
+        iq->warned_readonly_allocate = 1;
+        return NULL;
     }
 
     iqueue_index_t * const idx = iq->idx;
@@ -1050,22 +1120,22 @@ iqueue_allocate_raw(
 
     while (1)
     {
-	uint64_t tail = offset = idx->data_tail;
-	uint64_t new_tail = tail + len;
+        uint64_t tail = offset = idx->data_tail;
+        uint64_t new_tail = tail + len;
 
-	// Check to see if this would cross a 1 GB boundary and adjust
-	// the allocation upwards to avoid the boundary.  We also
-	// must avoid the first 64 bytes of the new block to avoid
-	// the markers.
-	if ((tail >> IQUEUE_BLOCK_SHIFT) != (new_tail >> IQUEUE_BLOCK_SHIFT))
-	{
-	    offset = ((tail >> IQUEUE_BLOCK_SHIFT) + 1) << IQUEUE_BLOCK_SHIFT;
-	    offset += sizeof(iqueue_block_t);
-	    new_tail = offset + len;
-	}
+        // Check to see if this would cross a 1 GB boundary and adjust
+        // the allocation upwards to avoid the boundary.  We also
+        // must avoid the first 64 bytes of the new block to avoid
+        // the markers.
+        if ((tail >> IQUEUE_BLOCK_SHIFT) != (new_tail >> IQUEUE_BLOCK_SHIFT))
+        {
+            offset = ((tail >> IQUEUE_BLOCK_SHIFT) + 1) << IQUEUE_BLOCK_SHIFT;
+            offset += sizeof(iqueue_block_t);
+            new_tail = offset + len;
+        }
 
-	if (atomic_cas_bool_64(&idx->data_tail, tail, new_tail))
-	    break;
+        if (atomic_compare_exchange_strong(&idx->data_tail, &tail, new_tail))
+            break;
     }
 
     // We have updated the idx->data_tail and can start to fill
@@ -1073,7 +1143,7 @@ iqueue_allocate_raw(
     // until iqueue_update() is called on the data pointer.
     void * const data = (void*)(uintptr_t) iqueue_get_data(iq, offset, 1);
     if (!data)
-	return NULL;
+        return NULL;
 
     *offset_out = iqueue_msg(offset, len);
     return data;
@@ -1098,16 +1168,17 @@ iqueue_cas(
 {
     // If the value is still 0, write our msg offset into it
     // If we fail, return immediately.
-    if (unlikely(!atomic_cas_bool_64(
-	(uint64_t*)(uintptr_t)&slot->v,
-	0,
-	new_msg.v
+    uint64_t const zero = 0;
+    if (unlikely(!atomic_compare_exchange_strong(
+        (uint64_t*)(uintptr_t)&slot->v,
+        &zero,
+        new_msg.v
     )))
-	return 0;
+        return 0;
 
     // Do not advance the tail for seal messages, so reader can see them
     if (unlikely(new_msg.v == IQUEUE_MSG_SEALED))
-	return 1;
+        return 1;
 
     // We have written our offset into slot id, try to advance
     // the tail to one past where we are, but do not care if
@@ -1115,9 +1186,9 @@ iqueue_cas(
     // the idx for us.
     const uint64_t current_tail = idx->index_tail;
     if (current_tail >= id + 1)
-	return 1;
+        return 1;
 
-    atomic_cas_bool_64(&idx->index_tail, current_tail, id + 1);
+    atomic_compare_exchange_strong(&idx->index_tail, &current_tail, id + 1);
 
     return 1;
 }
@@ -1134,12 +1205,12 @@ iqueue_new_table(
     iqueue_index_t * const idx = iq->idx;
     iqueue_msg_t msg;
     const void * const table_buf = iqueue_allocate_raw(
-	iq,
-	IQUEUE_TABLE_SIZE * sizeof(*idx->tables) + 32,
-	&msg
+        iq,
+        IQUEUE_TABLE_SIZE * sizeof(*idx->tables) + 32,
+        &msg
     );
     if (!table_buf)
-	return 0;
+        return 0;
 
     uint64_t offset = iqueue_msg_offset(msg);
 
@@ -1147,14 +1218,15 @@ iqueue_new_table(
     offset = (offset + 31) & ~31;
 
     // Attempt to store the new table into the correct slot
-    if (atomic_cas_bool_64(&idx->tables[table_num], 0, offset))
+    uint64_t const zero = 0;
+    if (atomic_compare_exchange_strong(&idx->tables[table_num], &zero, offset))
     {
-	TSLOGX(TSDIAG, "%s: New tables[%"PRIu64"] = %"PRIx64,
-	    iq->name,
-	    table_num,
-	    offset
-	);
-	return offset;
+        TSLOGXL(TSDIAG, "%s: New tables[%"PRIu64"] = %"PRIx64,
+            iq->name,
+            table_num,
+            offset
+        );
+        return offset;
     }
 
     // We lost the race, but now have a huge allocation.  Try
@@ -1163,8 +1235,8 @@ iqueue_new_table(
 
     while (++table_num < IQUEUE_TABLE_SIZE)
     {
-	if (atomic_cas_bool_64(&idx->tables[table_num], 0, offset))
-	    return correct_offset;
+        if (atomic_compare_exchange_strong(&idx->tables[table_num], &zero, offset))
+            return correct_offset;
     }
 
     // We've fully populated the tables?  This really shouldn't happen,
@@ -1191,33 +1263,33 @@ iqueue_get_slot(
 
     if (likely((last_table & IQUEUE_TABLE_MASK) == table_num))
     {
-	// Hurrah! We hit our cached value
-	table_offset = last_table >> IQUEUE_TABLE_SHIFT;
+        // Hurrah! We hit our cached value
+        table_offset = last_table >> IQUEUE_TABLE_SHIFT;
     } else {
-	// Not the cached value; do a full lookup
-	if (unlikely(table_num > IQUEUE_TABLE_SIZE))
-	    return NULL;
+        // Not the cached value; do a full lookup
+        if (unlikely(table_num > IQUEUE_TABLE_SIZE))
+            return NULL;
 
-	table_offset = iq->idx->tables[table_num];
-	if (unlikely(!table_offset))
-	{
-	    // There is no table for this id yet, create it if requested
-	    if (!create)
-		return NULL;
+        table_offset = iq->idx->tables[table_num];
+        if (unlikely(!table_offset))
+        {
+            // There is no table for this id yet, create it if requested
+            if (!create)
+                return NULL;
 
-	    table_offset = iqueue_new_table(iq, table_num);
-	    if (!table_offset)
-		return NULL;
-	}
+            table_offset = iqueue_new_table(iq, table_num);
+            if (!table_offset)
+                return NULL;
+        }
 
-	// We have a pointer to the table; cache the value and return the table
-	iq->table_cache = (table_offset << IQUEUE_TABLE_SHIFT) | table_num;
+        // We have a pointer to the table; cache the value and return the table
+        iq->table_cache = (table_offset << IQUEUE_TABLE_SHIFT) | table_num;
     }
 
     // We have a table offset now; find the actual block that goes with it
     iqueue_msg_t * const table = (void*)(uintptr_t) iqueue_get_data(iq, table_offset, 1);
     if (!table)
-	return NULL;
+        return NULL;
     return &table[offset];
 }
 
@@ -1235,33 +1307,33 @@ iqueue_try_update_internal(
 
     if (unlikely(tail != id))
     {
-	// If the id they are trying to write to is less than the
-	// current tail, it is guaranteed to fail since there is already
-	// something written there.
-	if (id < tail)
-	    return IQUEUE_STATUS_HAS_DATA;
+        // If the id they are trying to write to is less than the
+        // current tail, it is guaranteed to fail since there is already
+        // something written there.
+        if (id < tail)
+            return IQUEUE_STATUS_HAS_DATA;
 
-	// If the id they are trying to write to is not at the tail
-	// position, then it would leave a hole in the index.  This is
-	// not allowed, so the index might be invalid.  To confirm,
-	// check to see if the actual entries value is wrong.
-	if (id > iqueue_entries(iq))
-	    return IQUEUE_STATUS_INDEX_INVALID;
+        // If the id they are trying to write to is not at the tail
+        // position, then it would leave a hole in the index.  This is
+        // not allowed, so the index might be invalid.  To confirm,
+        // check to see if the actual entries value is wrong.
+        if (id > iqueue_entries(iq))
+            return IQUEUE_STATUS_INDEX_INVALID;
 
-	// It was a spurious case of the tail being wrong; allow the
-	// iqueue_try_update() to proceed.
+        // It was a spurious case of the tail being wrong; allow the
+        // iqueue_try_update() to proceed.
     }
 
     iqueue_msg_t * const slot = iqueue_get_slot(iq, id, 1);
     if (unlikely(!slot))
-	return IQUEUE_STATUS_INDEX_INVALID;
+        return IQUEUE_STATUS_INDEX_INVALID;
 
     if (likely(iqueue_cas(idx, slot, id, new_msg)))
-	return 0;
+        return 0;
 
     // We lost.  Check for the possibility that the iqueue has been sealed
     if (unlikely(slot->v == IQUEUE_MSG_SEALED))
-	return IQUEUE_STATUS_SEALED;
+        return IQUEUE_STATUS_SEALED;
 
     return IQUEUE_STATUS_HAS_DATA;
 }
@@ -1280,29 +1352,29 @@ iqueue_update_internal(
     // Find the next available slot
     while (1)
     {
-	const iqueue_id_t id = idx->index_tail;
-	iqueue_msg_t * const slot = iqueue_get_slot(iq, id, 1);
-	if (unlikely(!slot))
-	    return IQUEUE_STATUS_INDEX_INVALID;
+        const iqueue_id_t id = idx->index_tail;
+        iqueue_msg_t * const slot = iqueue_get_slot(iq, id, 1);
+        if (unlikely(!slot))
+            return IQUEUE_STATUS_INDEX_INVALID;
 
-	if (unlikely(slot->v == IQUEUE_MSG_SEALED))
-	    return IQUEUE_STATUS_SEALED;
+        if (unlikely(slot->v == IQUEUE_MSG_SEALED))
+            return IQUEUE_STATUS_SEALED;
 
-	if (unlikely(slot->v))
-	{
-	    // The list is in an inconsistent state; try to advance
-	    // the tail pointer.
-	    atomic_cas_bool_64(&idx->index_tail, id, id+1);
-	    continue;
-	}
+        if (unlikely(slot->v))
+        {
+            // The list is in an inconsistent state; try to advance
+            // the tail pointer.
+            atomic_compare_exchange_strong(&idx->index_tail, &id, id+1);
+            continue;
+        }
 
-	// Write to user slot before attempting the CAS to preserve
-	// all lockless guarantees.
-	if (id_out != NULL)
-	    *id_out = (is_id_be ? htobe64(id) : id);
+        // Write to user slot before attempting the CAS to preserve
+        // all lockless guarantees.
+        if (id_out != NULL)
+            *id_out = (is_id_be ? htobe64(id) : id);
 
-	if (likely(iqueue_cas(idx, slot, id, new_msg)))
-	    return 0;
+        if (likely(iqueue_cas(idx, slot, id, new_msg)))
+            return 0;
     }
 }
 
@@ -1357,7 +1429,7 @@ iqueue_seal(
 )
 {
     const iqueue_msg_t new_msg = {
-	.v = IQUEUE_MSG_SEALED
+        .v = IQUEUE_MSG_SEALED
     };
 
     return iqueue_update_internal(iq, new_msg, NULL, 0);
@@ -1371,7 +1443,7 @@ iqueue_try_seal(
 )
 {
     const iqueue_msg_t new_msg = {
-	.v = IQUEUE_MSG_SEALED
+        .v = IQUEUE_MSG_SEALED
     };
 
     return iqueue_try_update_internal(iq, id, new_msg);
@@ -1404,13 +1476,13 @@ iqueue_status(
 )
 {
     iqueue_msg_t * const slot
-	= iqueue_get_slot(__UNCONST_T(iqueue_t*, iq), id, 0);
+        = iqueue_get_slot(__UNCONST_T(iqueue_t*, iq), id, 0);
 
     if (!slot || !slot->v)
-	return IQUEUE_STATUS_NO_DATA;
+        return IQUEUE_STATUS_NO_DATA;
 
     if (slot->v == IQUEUE_MSG_SEALED)
-	return IQUEUE_STATUS_SEALED;
+        return IQUEUE_STATUS_SEALED;
 
     return IQUEUE_STATUS_HAS_DATA;
 }
@@ -1429,51 +1501,51 @@ iqueue_status_wait(
 
     while (1)
     {
-	if (!msg)
-	{
-	    // Try to get the slot, but do not modify the tables.
-	    // If we are blocking forever, keep trying
-	    msg = iqueue_get_slot(iq, id, 0);
-	    if (!msg && timeout_ns >= 0 && timeout_ns < 10)
-		    return IQUEUE_STATUS_NO_DATA;
-	}
+        if (!msg)
+        {
+            // Try to get the slot, but do not modify the tables.
+            // If we are blocking forever, keep trying
+            msg = iqueue_get_slot(iq, id, 0);
+            if (!msg && timeout_ns >= 0 && timeout_ns < 10)
+                    return IQUEUE_STATUS_NO_DATA;
+        }
 
-	if (msg)
-	{
-	    // We have the slot; try
-	    // Try a few times before checking the clock
-	    for (int i = 0 ; i < 1000 ; i++)
-	    {
-		if (unlikely(!msg->v)) {
-		    if (timeout_ns == 0)
-			return IQUEUE_STATUS_NO_DATA;
+        if (msg)
+        {
+            // We have the slot; try
+            // Try a few times before checking the clock
+            for (int i = 0 ; i < 1000 ; i++)
+            {
+                if (unlikely(!msg->v)) {
+                    if (timeout_ns == 0)
+                        return IQUEUE_STATUS_NO_DATA;
 
-		    _mm_pause();
-		    continue;
-		}
+                    _mm_pause();
+                    continue;
+                }
 
-		// Check if the iqueue is sealed at this index
-		if (unlikely(msg->v == IQUEUE_MSG_SEALED))
-		    return IQUEUE_STATUS_SEALED;
+                // Check if the iqueue is sealed at this index
+                if (unlikely(msg->v == IQUEUE_MSG_SEALED))
+                    return IQUEUE_STATUS_SEALED;
 
-		// Build a user-space pointer from the pointer
-		return IQUEUE_STATUS_HAS_DATA;
-	    }
-	}
+                // Build a user-space pointer from the pointer
+                return IQUEUE_STATUS_HAS_DATA;
+            }
+        }
 
-	// timeout == -1 means loop forever
-	if (timeout_ns == -1)
-	    continue;
+        // timeout == -1 means loop forever
+        if (timeout_ns == -1)
+            continue;
 
-	// timeout < 10 means just check the queue a few times
-	if (timeout_ns < 10)
-	    break;
+        // timeout < 10 means just check the queue a few times
+        if (timeout_ns < 10)
+            break;
 
-	if (!start_time)
-	    start_time = tsclock_getnanos(0);
+        if (!start_time)
+            start_time = tsclock_getnanos(0);
 
-	if (start_time + timeout_ns < tsclock_getnanos(0))
-	    break;
+        if (start_time + timeout_ns < tsclock_getnanos(0))
+            break;
     }
 
     return IQUEUE_STATUS_NO_DATA;
@@ -1491,20 +1563,20 @@ iqueue_offset(
     // Retrieve the map-space pointer
     iqueue_msg_t * const msg_ptr = iqueue_get_slot(iq, id, 0);
     if (unlikely(!msg_ptr))
-	return -1;
+        return -1;
 
     iqueue_msg_t msg = *msg_ptr;
     if (unlikely(!msg.v))
-	return -1;
+        return -1;
 
     // Check if the iqueue is sealed at this index
     if (unlikely(msg.v == IQUEUE_MSG_SEALED))
-	return -1;
+        return -1;
 
     if (likely(size_out))
-	*size_out = iqueue_msg_len(msg);
+        *size_out = iqueue_msg_len(msg);
 
-    TSLOGX(TSDIAG, "%s: %"PRIx64": %p = %"PRIx64, iq->name, id, msg_ptr, msg.v);
+    TSLOGXL(TSDIAG, "%s: %"PRIx64": %p = %"PRIx64, iq->name, id, msg_ptr, msg.v);
     return iqueue_msg_offset(msg);
 }
 
@@ -1518,11 +1590,11 @@ iqueue_is_sealed(
 
     while (1)
     {
-	int status = iqueue_status(iqueue, id++);
-	if (status == IQUEUE_STATUS_HAS_DATA)
-	    continue;
+        int status = iqueue_status(iqueue, id++);
+        if (status == IQUEUE_STATUS_HAS_DATA)
+            continue;
 
-	return status == IQUEUE_STATUS_SEALED;
+        return status == IQUEUE_STATUS_SEALED;
     }
 }
 
@@ -1536,13 +1608,13 @@ iqueue_allocator_init(
 )
 {
     memcpy(allocator, &(iqueue_allocator_t) {
-	.iq		= iq,
-	.bulk_len	= bulk_len,
-	.auto_refill	= auto_refill,
+        .iq             = iq,
+        .bulk_len       = bulk_len,
+        .auto_refill    = auto_refill,
     }, sizeof(*allocator));
 
     if (iqueue_allocator_refill(allocator) < 0)
-	return -1;
+        return -1;
 
     return 0;
 }
@@ -1556,21 +1628,21 @@ iqueue_allocator_refill(
 {
     iqueue_msg_t msg;
     allocator->base = iqueue_allocate_raw(
-	allocator->iq,
-	allocator->bulk_len,
-	&msg
+        allocator->iq,
+        allocator->bulk_len,
+        &msg
     );
     if (!allocator->base)
-	return -1;
+        return -1;
 
     allocator->base_offset = iqueue_msg_offset(msg);
     allocator->offset = 0;
 
-    TSLOGX(TSDEBUG, "%s: Refill base=%p offset=%"PRIx64" len=%"PRIx64,
-	allocator->iq->name,
-	allocator->base,
-	allocator->base_offset,
-	allocator->bulk_len
+    TSLOGXL(TSDEBUG, "%s: Refill base=%p offset=%"PRIx64" len=%"PRIx64,
+        allocator->iq->name,
+        allocator->base,
+        allocator->base_offset,
+        allocator->bulk_len
     );
 
     return 0;
@@ -1588,10 +1660,10 @@ iqueue_realloc(
     const uint64_t msg_len = iqueue_msg_len(*msg);
 
     return iqueue_realloc_bulk(
-	allocator,
-	msg,
-	msg_len,
-	new_len
+        allocator,
+        msg,
+        msg_len,
+        new_len
     );
 }
 
@@ -1606,7 +1678,7 @@ iqueue_realloc_bulk(
 {
     const uint64_t msg_offset = iqueue_msg_offset(*msg);
     if (new_len > IQUEUE_MSG_MAX || new_len > msg_len)
-	return -1;
+        return -1;
 
     // Where was the offset after this message was allocated
     const uint64_t cur_offset = msg_offset + msg_len - allocator->base_offset;
@@ -1618,9 +1690,9 @@ iqueue_realloc_bulk(
     // then further allocations have been done and we can't
     // resize this one.
     // \todo: Can we do this with atomics to save on locking?
-    //return atomic_cas_bool_64(&allocator->offset, cur_offset, new_offset);
+    //return atomic_compare_exchange_strong(&allocator->offset, &cur_offset, new_offset);
     if (allocator->offset != cur_offset)
-	return 0;
+        return 0;
     allocator->offset = new_offset;
     *msg = iqueue_msg(msg_offset, new_len);
     return 1;
@@ -1637,17 +1709,18 @@ iqueue_prefetch(
 {
     for (uint64_t offset = 0 ; offset < extent ; offset += 4096)
     {
-	volatile uint64_t * data = (void*)(uintptr_t) iqueue_get_data(iq, base + offset, 1);
-	if (!data)
-	{
-	    TSLOGX(TSERROR, "%s: Unable to get data at offset %"PRIx64, iq->name, base + offset);
-	    return -1;
-	}
+        volatile uint64_t * data = (void*)(uintptr_t) iqueue_get_data(iq, base + offset, 1);
+        if (!data)
+        {
+            TSLOGXL(TSERROR, "%s: Unable to get data at offset %"PRIx64, iq->name, base + offset);
+            return -1;
+        }
 
-	if (iq->mmap_prot & PROT_WRITE)
-	    atomic_cas_bool_64(data, 0, 0);
-	else
-	    data[0];
+        uint64_t const zero = 0;
+        if (iq->mmap_prot & PROT_WRITE)
+            atomic_compare_exchange_strong(data, &zero, 0);
+        else
+            data[0];
     }
 
     return 0;
@@ -1671,27 +1744,27 @@ prefetch_thread(
 
     while (1)
     {
-	if (prefetch_delay)
-	    usleep(prefetch_delay);
+        if (prefetch_delay)
+            usleep(prefetch_delay);
 
-	if (iq->idx->data_tail + prefetch_size / 2 < offset)
-	    continue;
+        if (iq->idx->data_tail + prefetch_size / 2 < offset)
+            continue;
 
-	// They have used up more than half our last block.
-	// Start prefetching the next block
-	uint64_t prefetch_time = -tsclock_getnanos(0);
-	if (iqueue_prefetch(iq, offset, prefetch_size) < 0)
-	    break;
+        // They have used up more than half our last block.
+        // Start prefetching the next block
+        uint64_t prefetch_time = -tsclock_getnanos(0);
+        if (iqueue_prefetch(iq, offset, prefetch_size) < 0)
+            break;
 
-	prefetch_time += tsclock_getnanos(0);
-	TSLOGX(TSDEBUG, "%s: Prefetched %"PRIx64" to %"PRIx64" in %"PRIu64" ns",
-	    iq->name,
-	    offset,
-	    offset + prefetch_size,
-	    prefetch_time
-	);
+        prefetch_time += tsclock_getnanos(0);
+        TSLOGXL(TSDEBUG, "%s: Prefetched %"PRIx64" to %"PRIx64" in %"PRIu64" ns",
+            iq->name,
+            offset,
+            offset + prefetch_size,
+            prefetch_time
+        );
 
-	offset += prefetch_size;
+        offset += prefetch_size;
     }
 
     return NULL;
@@ -1707,12 +1780,12 @@ iqueue_prefetch_thread(
     if (!iq->prefetch_thread
     && pthread_create(&iq->prefetch_thread, NULL, prefetch_thread, iq) < 0)
     {
-	TSLOG(TSERROR, "%s: Unable to create prefetch thread", iq->name);
-	return -1;
+        TSLOGL(TSERROR, "%s: Unable to create prefetch thread", iq->name);
+        return -1;
     }
 
     if (thread_out)
-	*thread_out = iq->prefetch_thread;
+        *thread_out = iq->prefetch_thread;
     return 0;
 }
 
@@ -1732,27 +1805,27 @@ syncbehind_thread(
 
     while (1)
     {
-	if (syncbehind_delay)
-	    usleep(syncbehind_delay);
+        if (syncbehind_delay)
+            usleep(syncbehind_delay);
 
-	while (mapped_to_block_id < IQUEUE_BLOCK_COUNT &&
-		iq->blocks[mapped_to_block_id] != NULL)
-	    mapped_to_block_id++;
+        while (mapped_to_block_id < IQUEUE_BLOCK_COUNT &&
+                iq->blocks[mapped_to_block_id] != NULL)
+            mapped_to_block_id++;
 
-	// They have used up more than half our last block.
-	// Start prefetching the next block
-	for (; mapped_to_block_id - synced_to_block_id > active_block_count;
-		synced_to_block_id++) {
-	    uint64_t syncbehind_time = -tsclock_getnanos(0);
-	    iqueue_fsync_block(iq, synced_to_block_id);
+        // They have used up more than half our last block.
+        // Start prefetching the next block
+        for (; mapped_to_block_id - synced_to_block_id > active_block_count;
+                synced_to_block_id++) {
+            uint64_t syncbehind_time = -tsclock_getnanos(0);
+            iqueue_fsync_block(iq, synced_to_block_id);
 
-	    syncbehind_time += tsclock_getnanos(0);
-	    TSLOGX(TSINFO, "%s: Synced block %"PRIu64" in %"PRIu64" ns",
-		iq->name,
-		synced_to_block_id,
-		syncbehind_time
-	    );
-	}
+            syncbehind_time += tsclock_getnanos(0);
+            TSLOGXL(TSINFO, "%s: Synced block %"PRIu64" in %"PRIu64" ns",
+                iq->name,
+                synced_to_block_id,
+                syncbehind_time
+            );
+        }
     }
 
     return NULL;
@@ -1768,12 +1841,12 @@ iqueue_syncbehind_thread(
     if (!iq->syncbehind_thread
     && pthread_create(&iq->syncbehind_thread, NULL, syncbehind_thread, iq) < 0)
     {
-	TSLOG(TSERROR, "%s: Unable to create syncbehind thread", iq->name);
-	return -1;
+        TSLOGL(TSERROR, "%s: Unable to create syncbehind thread", iq->name);
+        return -1;
     }
 
     if (thread_out)
-	*thread_out = iq->syncbehind_thread;
+        *thread_out = iq->syncbehind_thread;
     return 0;
 }
 
@@ -1788,48 +1861,48 @@ iqueue_table_debug(
 
     for (uint64_t i = 0 ; i < IQUEUE_TABLE_SIZE ; i++)
     {
-	const uint64_t offset = iq->idx->tables[i];
-	if (!offset)
-	    continue;
+        const uint64_t offset = iq->idx->tables[i];
+        if (!offset)
+            continue;
 
-	TSLOGX(TSINFO, "%s: table[0x%"PRIx64"] offset 0x%"PRIx64"%s",
-	    iq->name,
-	    i,
-	    offset,
-	    (offset & 0x7) ? " UNALIGNED" : ""
-	);
+        TSLOGXL(TSINFO, "%s: table[0x%"PRIx64"] offset 0x%"PRIx64"%s",
+            iq->name,
+            i,
+            offset,
+            (offset & 0x7) ? " UNALIGNED" : ""
+        );
 
-	const uint64_t * const table = iqueue_get_data(iq, offset, 1);
-	if (!table)
-	    TSABORTX("%s: Unable to get table %"PRIu64"?", iq->name, i);
+        const uint64_t * const table = iqueue_get_data(iq, offset, 1);
+        if (!table)
+            TSABORTX("%s: Unable to get table %"PRIu64"?", iq->name, i);
 
-	for (uint64_t j = 0 ; j <= IQUEUE_TABLE_MASK ; j++)
-	{
-	    iqueue_msg_t msg = { .v = table[j] };
-	    const uint64_t off = iqueue_msg_offset(msg);
-	    const uint64_t len = iqueue_msg_len(msg);
-	    if (!off && !len)
-	    {
-		skipped++;
-		continue;
-	    }
+        for (uint64_t j = 0 ; j <= IQUEUE_TABLE_MASK ; j++)
+        {
+            iqueue_msg_t msg = { .v = table[j] };
+            const uint64_t off = iqueue_msg_offset(msg);
+            const uint64_t len = iqueue_msg_len(msg);
+            if (!off && !len)
+            {
+                skipped++;
+                continue;
+            }
 
-	    if (skipped)
-		TSLOGX(TSERROR, "%s: Missing indices in table 0x%"PRIx64"!", iq->name, i);
+            if (skipped)
+                TSLOGXL(TSERROR, "%s: Missing indices in table 0x%"PRIx64"!", iq->name, i);
 
-	    const struct iqsync_data * const iqsync = iqsync_data_msg(iq, off);
+            const struct iqsync_data * const iqsync = iqsync_data_msg(iq, off);
 
-	    printf("%"PRIx64",%"PRIx64",%"PRIx64":%"PRIu64",%"PRIx64":%"PRIu64",%"PRIx64",%"PRIu64"\n",
-		i,
-		j,
-		iqsync ? be64toh(iqsync->orig_src) : 0,
-		iqsync ? be64toh(iqsync->orig_index) : 0,
-		iqsync ? be64toh(iqsync->src) : 0,
-		iqsync ? be64toh(iqsync->iq_index) : 0,
-		off,
-		len
-	    );
-	}
+            printf("%"PRIx64",%"PRIx64",%"PRIx64":%"PRIu64",%"PRIx64":%"PRIu64",%"PRIx64",%"PRIu64"\n",
+                i,
+                j,
+                iqsync ? be64toh(iqsync->orig_src) : 0,
+                iqsync ? be64toh(iqsync->orig_index) : 0,
+                iqsync ? be64toh(iqsync->src) : 0,
+                iqsync ? be64toh(iqsync->iq_index) : 0,
+                off,
+                len
+            );
+        }
     }
 }
 
@@ -1842,63 +1915,63 @@ iqueue_debug(
 {
     if (id == (uint64_t) -1)
     {
-	iqueue_table_debug(iq);
-	return;
+        iqueue_table_debug(iq);
+        return;
     }
 
     size_t len;
     uint64_t offset = iqueue_offset(iq, id, &len);
     if (offset == (uint64_t) -1)
     {
-	TSLOGX(TSINFO, "%s: %"PRIu64": No slot allocated",
-	    iq->name,
-	    id
-	);
-	return;
+        TSLOGXL(TSINFO, "%s: %"PRIu64": No slot allocated",
+            iq->name,
+            id
+        );
+        return;
     }
 
     const volatile iqueue_msg_t * const slot = iqueue_get_slot(iq, id, 0);
-    TSLOGX(TSINFO, "%s: %"PRIu64": offset=%"PRId64" len=%zu slot=%p%s",
-	iq->name,
-	id,
-	offset,
-	len,
-	slot,
-	((uintptr_t) slot & 7) ? " UNALIGNED" : ""
+    TSLOGXL(TSINFO, "%s: %"PRIu64": offset=%"PRId64" len=%zu slot=%p%s",
+        iq->name,
+        id,
+        offset,
+        len,
+        slot,
+        ((uintptr_t) slot & 7) ? " UNALIGNED" : ""
     );
 
     const struct iqsync_data * const msg = iqsync_data_msg(iq, offset);
     if (msg)
     {
-	TSLOGX(TSINFO, "%s: %"PRIu64": sending src=%"PRIu64":%"PRIu64" len=%u",
-	    iq->name,
-	    id,
-	    be64toh(msg->src),
-	    be64toh(msg->iq_index),
-	    be32toh(msg->len)
-	);
+        TSLOGXL(TSINFO, "%s: %"PRIu64": sending src=%"PRIu64":%"PRIu64" len=%u",
+            iq->name,
+            id,
+            be64toh(msg->src),
+            be64toh(msg->iq_index),
+            be32toh(msg->len)
+        );
 
-	TSLOGX(TSINFO, "%s: %"PRIu64": orig src=%"PRIu64":%"PRIu64,
-	    iq->name,
-	    id,
-	    be64toh(msg->orig_src),
-	    be64toh(msg->orig_index)
-	);
+        TSLOGXL(TSINFO, "%s: %"PRIu64": orig src=%"PRIu64":%"PRIu64,
+            iq->name,
+            id,
+            be64toh(msg->orig_src),
+            be64toh(msg->orig_index)
+        );
     }
 
     const void * const data = iqueue_get_data(iq, offset, 1);
     if (!data)
     {
-	TSLOGX(TSERROR,
-	    "%s: %"PRIu64": Unable to retrieve data at offset %"PRIu64"?",
-	    iq->name,
-	    id,
-	    offset
-	);
-	return;
+        TSLOGXL(TSERROR,
+            "%s: %"PRIu64": Unable to retrieve data at offset %"PRIu64"?",
+            iq->name,
+            id,
+            offset
+        );
+        return;
     }
 
-    TSHDUMP(TSINFO, data, len);
+    TSHDUMPL(TSINFO, data, len);
 }
 
 
@@ -1913,58 +1986,59 @@ _iqueue_writer_table(
 )
 {
     if (table_id >= IQUEUE_WRITER_TABLES)
-	return NULL;
+        return NULL;
     if (iq->writer_tables[table_id])
-	return iq->writer_tables[table_id];
+        return iq->writer_tables[table_id];
 
     iqueue_index_t * const idx = iq->idx;
     iqueue_msg_t table_msg = idx->writer_tables[table_id];
 
     if (table_msg.v == 0)
     {
-	if (!create)
-	    return NULL;
+        if (!create)
+            return NULL;
 
-	const size_t table_len = IQUEUE_WRITER_MAX * sizeof(shash_entry_t);
-	const size_t table_max_len = table_len + IQUEUE_WRITER_MASK;
+        const size_t table_len = IQUEUE_WRITER_MAX * sizeof(shash_entry_t);
+        const size_t table_max_len = table_len + IQUEUE_WRITER_MASK;
 
-	void * const table_buf = iqueue_allocate_raw(
-	    iq,
-	    table_max_len,
-	    &table_msg
-	);
-	if (!table_buf)
-	{
-	    TSLOGX(TSERROR, "%s: Unable to allocate table space %zu bytes",
-		iqueue_name(iq),
-		table_max_len
-	    );
-	    return NULL;
-	}
+        void * const table_buf = iqueue_allocate_raw(
+            iq,
+            table_max_len,
+            &table_msg
+        );
+        if (!table_buf)
+        {
+            TSLOGXL(TSERROR, "%s: Unable to allocate table space %zu bytes",
+                iqueue_name(iq),
+                table_max_len
+            );
+            return NULL;
+        }
 
-	// Force alignment of the table since it will have 16-byte
-	// CAS operations done on it.
-	uint64_t offset = iqueue_msg_offset(table_msg);
-	offset = (offset + IQUEUE_WRITER_MASK) & ~IQUEUE_WRITER_MASK;
-	table_msg = iqueue_msg(offset, table_len);
+        // Force alignment of the table since it will have 16-byte
+        // CAS operations done on it.
+        uint64_t offset = iqueue_msg_offset(table_msg);
+        offset = (offset + IQUEUE_WRITER_MASK) & ~IQUEUE_WRITER_MASK;
+        table_msg = iqueue_msg(offset, table_len);
 
-	// Atomic swap it into the header; if this fails we do not care.
-	// Some space in the iqueue will leak, but that is not a problem.
-	atomic_cas_64(
-	    (void*)(uintptr_t) &idx->writer_tables[table_id].v,
-	    0,
-	    table_msg.v
-	);
+        // Atomic swap it into the header; if this fails we do not care.
+        // Some space in the iqueue will leak, but that is not a problem.
+        iqueue_msg_t* const null = NULL;
+        atomic_compare_exchange_strong(
+            &idx->writer_tables[table_id].v,
+            &null,
+            table_msg.v
+        );
 
-	// Re-read the writer_table; either we succeeded or someone else has
-	// already written to it.
-	table_msg = idx->writer_tables[table_id];
+        // Re-read the writer_table; either we succeeded or someone else has
+        // already written to it.
+        table_msg = idx->writer_tables[table_id];
 
-	TSLOGX(TSINFO, "%s: Created writer table offset 0x%"PRIx64" size %zu",
-	    iqueue_name(iq),
-	    iqueue_msg_offset(table_msg),
-	    iqueue_msg_len(table_msg)
-	);
+        TSLOGXL(TSINFO, "%s: Created writer table offset 0x%"PRIx64" size %zu",
+            iqueue_name(iq),
+            iqueue_msg_offset(table_msg),
+            iqueue_msg_len(table_msg)
+        );
     }
 
     const size_t table_len = iqueue_msg_len(table_msg);
@@ -1974,22 +2048,22 @@ _iqueue_writer_table(
 
     if (!table_buf)
     {
-	TSLOGX(TSERROR, "%s: Unable to retrieve table at offset 0x%"PRIx64,
-	    iqueue_name(iq),
-	    table_offset
-	);
-	return NULL;
+        TSLOGXL(TSERROR, "%s: Unable to retrieve table at offset 0x%"PRIx64,
+            iqueue_name(iq),
+            table_offset
+        );
+        return NULL;
     }
 
     shash_t * const sh = shash_create(table_buf, table_len, 0);
     if (!sh)
     {
-	TSLOGX(TSERROR, "%s: Unable to generate table %p @ %zu",
-	    iqueue_name(iq),
-	    table_buf,
-	    table_len
-	);
-	return NULL;
+        TSLOGXL(TSERROR, "%s: Unable to generate table %p @ %zu",
+            iqueue_name(iq),
+            table_buf,
+            table_len
+        );
+        return NULL;
     }
 
     // This might race with another thread, causing this to leak.
@@ -2021,21 +2095,21 @@ iqueue_writer_update(
 {
     while (1)
     {
-	const uint64_t cur_timestamp = writer->value;
+        const uint64_t cur_timestamp = writer->value;
 
-	// If the new value is less than the old value
-	// (and the old value is not -1), then there is no update
-	// to be performed.
-	if (cur_timestamp != (uint64_t) -1
-	&&  cur_timestamp >= new_timestamp)
-	    return 0;
+        // If the new value is less than the old value
+        // (and the old value is not -1), then there is no update
+        // to be performed.
+        if (cur_timestamp != (uint64_t) -1
+        &&  cur_timestamp >= new_timestamp)
+            return 0;
 
-	if (shash_update(
-	    sh,
-	    writer,
-	    cur_timestamp,
-	    new_timestamp
-	))
-	    return 1;
+        if (shash_update(
+            sh,
+            writer,
+            cur_timestamp,
+            new_timestamp
+        ))
+            return 1;
     }
 }

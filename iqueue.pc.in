@@ -1,0 +1,10 @@
+prefix=@prefix@
+exec_prefix=@exec_prefix@
+libdir=@libdir@
+includedir=@includedir@
+
+Name: iqueue
+Description: The complete iqueue library
+Version: 0.1.0
+Cflags: -I${includedir}
+Libs: -L${libdir} -liqueue -lpthread

@@ -1,0 +1,143 @@
+#! /bin/bash
+#   Copyright 2021 Two Sigma Open Source, LLC
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+# Test multiple iqsync's writing into the same iqueue, reading from
+# the same iqueue.
+
+# Global settings
+DIR=$(dirname $0)
+PROG=$(basename $0)
+PKGDIR=$(cd $(dirname ${0})/../..; pwd -L)
+
+# Populate the TS_*_HOME variables
+eval $($(${PKGDIR}/bin/gettools)/bin/makepath -s -r ${PKGDIR})
+
+WORKDIR="$(mktemp -d -t $PROG.XXXXXXXXXX)"
+DCATSIMPLE=${TS_DCAT_NATIVE_HOME}/bin/dcatsimple
+trap "rm -fr $WORKDIR" 0 1 2 3 15
+
+echo Using $WORKDIR
+IQ1=$WORKDIR/iq1.iqx
+IQ2=$WORKDIR/iq2.iqx
+
+die() {
+    echo >&2 "$@"
+    exit 1
+}
+
+warn() {
+    echo >&2 "$@"
+}
+
+log() {
+    echo >&2 "--------- $@ -----------"
+}
+
+export IQSYNC_CMD=${PKGDIR}/bin/iqsync
+export IQSYNC_RSH=${PKGDIR}/sh/nop-ssh
+
+echo HEADER | ${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --create \
+    --header \
+|| die "$IQ1: Unable to create"
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --line \
+    <<EOF
+iq1.1
+iq1.2
+iq1.3
+iq1.4
+EOF
+
+count=2
+log "Starting $count iqsync processes"
+
+for i in `seq 1 $count`; do
+    $IQSYNC_CMD \
+	-f $IQ2 \
+	--clone \
+	--report-interval 1 \
+	--sleep 100 \
+	--tail \
+	localhost:$IQ1 \
+	> $WORKDIR/iqsync.$i.log \
+	2>&1 \
+	&
+done
+
+sleep 2
+$PKGDIR/bin/iqueue -f $IQ2 --watch &
+watchpid=$!
+
+log "Updating writer status"
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --writer 3,1 \
+
+sleep 2
+log "Adding items"
+for i in `seq 1 10`; do
+    $PKGDIR/bin/iqueue \
+	-f $IQ1 \
+	--writer 4,$i \
+
+    seq 1 1000000 | $PKGDIR/bin/iqueue \
+	-f $IQ1 \
+	--line \
+
+    sleep 2
+done
+
+cat > /dev/null \
+    <<EOF
+iq1.5
+iq1.6
+iq1.7
+iq1.8
+iq1.9
+iq1.10
+EOF
+
+
+log "Waiting"
+
+sleep 20
+kill $watchpid
+log "Checking iqueues"
+
+for iq in $IQ1 $IQ2; do
+    $PKGDIR/bin/iqueue \
+	-f $iq \
+	> $iq.txt \
+
+    $PKGDIR/bin/iqueue \
+	-f $iq \
+	--stats \
+
+done
+
+for iq in $IQ1 $IQ2; do
+    $PKGDIR/bin/iqueue \
+	-f $iq \
+	--debug -1 \
+	> $iq.debug \
+
+done
+
+diff $WORKDIR/iq{1,2}.iqx.txt || die "second sync failed"

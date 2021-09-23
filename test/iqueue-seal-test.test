@@ -1,0 +1,110 @@
+#! /bin/bash
+#   Copyright 2021 Two Sigma Open Source, LLC
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+# Global settings
+DIR=$(dirname $0)
+PROG=$(basename $0)
+PKGDIR=$(cd $(dirname ${0})/../..; pwd -L)
+
+# Populate the TS_*_HOME variables
+eval $($(${PKGDIR}/bin/gettools)/bin/makepath -s -r ${PKGDIR})
+
+WORKDIR="$(mktemp -d -t $PROG.XXXXXXXXXX)"
+trap "rm -fr $WORKDIR" 0 1 2 3 15
+
+echo Using $WORKDIR
+IQ1=$WORKDIR/iq1.iqx
+
+die() {
+    echo >&2 "$@"
+    if [ ! -z "$APPEND_PID" ]; then
+	killall $APPEND_PID
+    fi
+
+    rm -rf $WORKDIR
+    exit 1
+}
+
+warn() {
+    echo >&2 "$@"
+}
+
+trap "die Caught signal" 1 2 3 15
+trap "rm -rf $WORKDIR" 0
+
+
+# This test will add data into an iqueue that will then be sealed
+# to test that it can recover and keep writing
+
+${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --create \
+|| die "$IQ1: Unable to create"
+
+perl -e '$|=1; for my $i (0..12) { print "$i\n"; sleep 1 }' \
+| ${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --line \
+    --follow &
+
+APPEND_PID=$!
+
+sleep 5
+
+warn "Sealing $IQ1"
+${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --seal \
+|| die "$IQ1: Unable to seal"
+
+# Verify that only the five samples are in place
+${PKGDIR}/bin/iqueue -f $IQ1 > $WORKDIR/iq1.txt
+cat <<EOF | cmp - $WORKDIR/iq1.txt || die "failed first comparison"
+0
+1
+2
+3
+4
+5
+EOF
+
+sleep 1
+${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --archive \
+|| die "$IQ1: Unable to archive"
+
+sleep 5
+
+${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --create \
+|| die "$IQ1: Unable to re-create"
+
+
+sleep 5
+kill $APPEND_PID
+${PKGDIR}/bin/iqueue -f $IQ1 > $WORKDIR/iq1.txt
+cat <<EOF | cmp - $WORKDIR/iq1.txt || die "failed second comparison"
+6
+7
+8
+9
+10
+11
+12
+EOF
+
+warn "All tests passed"

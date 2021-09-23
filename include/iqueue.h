@@ -1,24 +1,28 @@
-/*	$TwoSigma: iqueue.h,v 1.21 2012/02/07 13:37:46 thudson Exp $	*/
-
 /*
- *	Copyright (c) 2010 Two Sigma Investments, LLC
- *	All Rights Reserved
+ *    Copyright 2021 Two Sigma Open Source, LLC
  *
- *	THIS IS UNPUBLISHED PROPRIETARY SOURCE CODE OF
- *      Two Sigma Investments, LLC.
+ *    Licensed under the Apache License, Version 2.0 (the "License");
+ *    you may not use this file except in compliance with the License.
+ *    You may obtain a copy of the License at
  *
- *	The copyright notice above does not evidence any
- *	actual or intended publication of such source code.
+ *        http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *    Unless required by applicable law or agreed to in writing, software
+ *    distributed under the License is distributed on an "AS IS" BASIS,
+ *    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *    See the License for the specific language governing permissions and
+ *    limitations under the License.
  */
 
 #ifndef _iqueue_h_
 #define _iqueue_h_
 
-#include "twosigma.h"
+#include <endian.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
 #include <sys/types.h>
-#include "bswap.h"
+#include <string.h>
 #include "shash.h"
 
 __BEGIN_DECLS
@@ -49,9 +53,9 @@ typedef struct {
 } iqueue_msg_t;
 
 #define IQUEUE_MSG_SEALED   ((uint64_t)-1)
-#define IQUEUE_MSG_BITS	    44
-#define IQUEUE_MSG_MASK	    ((((uint64_t) 1) << IQUEUE_MSG_BITS) - 1)
-#define IQUEUE_MSG_MAX	    ((((uint64_t) 1) << (64 - IQUEUE_MSG_BITS)) - 1)
+#define IQUEUE_MSG_BITS     44
+#define IQUEUE_MSG_MASK     ((((uint64_t) 1) << IQUEUE_MSG_BITS) - 1)
+#define IQUEUE_MSG_MAX      ((((uint64_t) 1) << (64 - IQUEUE_MSG_BITS)) - 1)
 #define IQUEUE_MSG_BAD_ID   ((uint64_t) -1)
 
 
@@ -61,7 +65,7 @@ iqueue_msg(
     uint64_t len
 ) {
     return (iqueue_msg_t) {
-	(len << IQUEUE_MSG_BITS) | (offset & IQUEUE_MSG_MASK)
+        (len << IQUEUE_MSG_BITS) | (offset & IQUEUE_MSG_MASK)
     };
 }
 
@@ -93,6 +97,19 @@ iqueue_t *
 iqueue_open(
     const char * index_file,
     bool writable
+);
+
+
+/** Update an iqueue's creation_time
+ *
+ * @param creation_time: the new creation_time
+ *
+ * @return -1 if there are any errors.
+ */
+int
+iqueue_update_creation_time(
+    iqueue_t * iq,
+    uint64_t creation_time
 );
 
 
@@ -233,29 +250,6 @@ iqueue_name(
     const iqueue_t * iqueue
 );
 
-
-typedef enum {
-    IQUEUE_MADV_WILLNEED,
-    IQUEUE_MADV_DONTNEED,
-} iqueue_madvise_t;
-
-/** Advise the kernel about regions of the iqueue.
- * @param start and end define the indices that are of interest.
- *
- * \note Since the iqueue data segment might not
- * be contiguous and in order, it is possible for the portion of
- * the file defined by start to be earlier than the region
- * defined by end.  No madvise request will be made in that case.
- */
-int
-iqueue_madavise(
-    iqueue_t * iqueue,
-    iqueue_madvise_t advice,
-    iqueue_id_t start,
-    iqueue_id_t end
-);
-
-
 /** Retrieve the shared hash of writers.
  *
  * The iqueue maintains a list of entries of "writers" that can
@@ -304,9 +298,9 @@ iqueue_writer_update(
 
 
 
-#define IQUEUE_BLOCK_SHIFT	30
-#define IQUEUE_BLOCK_SIZE	((uint64_t) (1 << IQUEUE_BLOCK_SHIFT))
-#define IQUEUE_BLOCK_MASK	(IQUEUE_BLOCK_SIZE - 1)
+#define IQUEUE_BLOCK_SHIFT      30
+#define IQUEUE_BLOCK_SIZE       ((uint64_t) (1 << IQUEUE_BLOCK_SHIFT))
+#define IQUEUE_BLOCK_MASK       (IQUEUE_BLOCK_SIZE - 1)
 
 
 /** Returns the id of the first entry in the iqueue */
@@ -392,8 +386,8 @@ iqueue_data(
 )
 {
     uint64_t offset = iqueue_offset(iq, id, size_out);
-    if (unlikely(offset == (uint64_t) -1))
-	return NULL;
+    if (offset == (uint64_t) -1)
+        return NULL;
 
     return iqueue_get_data(iq, offset, 1);
 }
@@ -470,27 +464,27 @@ iqueue_allocate(
     iqueue_msg_t * msg_out
 )
 {
-    if (unlikely(len > allocator->bulk_len))
-	return NULL;
+    if (len > allocator->bulk_len)
+        return NULL;
 
     while (1)
     {
-	uint64_t base = allocator->base_offset + allocator->offset;
-	uint64_t aligned = (base + allocator->align_mask)
-	    & ~allocator->align_mask;
-	uint64_t offset = aligned + len - allocator->base_offset;
+        uint64_t base = allocator->base_offset + allocator->offset;
+        uint64_t aligned = (base + allocator->align_mask)
+            & ~allocator->align_mask;
+        uint64_t offset = aligned + len - allocator->base_offset;
 
-	if (likely(offset <= allocator->bulk_len))
-	{
-	    allocator->offset = offset;
-	    *msg_out = iqueue_msg(aligned, len);
-	    return allocator->base + aligned - allocator->base_offset;
-	}
+        if (offset <= allocator->bulk_len)
+        {
+            allocator->offset = offset;
+            *msg_out = iqueue_msg(aligned, len);
+            return allocator->base + aligned - allocator->base_offset;
+        }
 
-	// It didn't fit; try to get more space
-	if (!allocator->auto_refill
-	|| iqueue_allocator_refill(allocator) < 0)
-	    return NULL;
+        // It didn't fit; try to get more space
+        if (!allocator->auto_refill
+        || iqueue_allocator_refill(allocator) < 0)
+            return NULL;
     }
 }
 
@@ -567,12 +561,12 @@ iqueue_append(
 )
 {
     if (len >= IQUEUE_MSG_MAX)
-	return IQUEUE_STATUS_INVALID_ARGUMENT;
+        return IQUEUE_STATUS_INVALID_ARGUMENT;
 
     iqueue_msg_t iqmsg;
     void * const msg = iqueue_allocate_raw(iq, len, &iqmsg);
     if (!msg)
-	return IQUEUE_STATUS_NO_SPACE;
+        return IQUEUE_STATUS_NO_SPACE;
 
     memcpy(msg, buf, len);
     int rc = iqueue_update(iq, iqmsg, NULL);

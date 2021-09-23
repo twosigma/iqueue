@@ -1,0 +1,14 @@
+Indexed queue.
+
+A persistent, connectionless, message-based transport.
+
+- Stored in a single file
+- No additional processes
+- No setup required beyond opening the file and beginning to read or write
+- Multi-reader, each reader gets every message
+- Multi-writer, writes are atomic and persistent
+
+
+NOTE:
+
+iqueue fails with a SIGBUS when it runs out of disk-space.

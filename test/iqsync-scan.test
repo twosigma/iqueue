@@ -1,0 +1,224 @@
+#! /bin/bash
+#   Copyright 2021 Two Sigma Open Source, LLC
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+# Populate an iqueue, sync it into a second iqueue.
+# Add more entries, restart the sync
+
+# Global settings
+DIR=$(dirname $0)
+PROG=$(basename $0)
+PKGDIR=$(cd $(dirname ${0})/../..; pwd -L)
+
+# Populate the TS_*_HOME variables
+eval $($(${PKGDIR}/bin/gettools)/bin/makepath -s -r ${PKGDIR})
+
+WORKDIR="$(mktemp -d -t $PROG.XXXXXXXXXX)"
+DCATSIMPLE=${TS_DCAT_NATIVE_HOME}/bin/dcatsimple
+trap "rm -fr $WORKDIR" 0 1 2 3 15
+
+echo Using $WORKDIR
+IQ1=$WORKDIR/iq1.iqx
+IQ2=$WORKDIR/iq2.iqx
+IQ3=$WORKDIR/iq3.iqx
+
+die() {
+    echo >&2 "$@"
+    exit 1
+}
+
+warn() {
+    echo >&2 "$@"
+}
+
+log() {
+    echo >&2 "--------- $@ -----------"
+}
+
+export IQSYNC_CMD=${PKGDIR}/bin/iqsync
+export IQSYNC_RSH=${PKGDIR}/sh/nop-ssh
+
+iqueue-append() {
+    $PKGDIR/bin/iqueue \
+	--append \
+	-f $1 \
+    || die "$1: Unable to append"
+}
+
+
+echo HEADER | ${PKGDIR}/bin/iqueue \
+    -f $IQ1 \
+    --create \
+    --header \
+|| die "$IQ1: Unable to create"
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --line \
+    <<EOF
+iq1.1
+iq1.2
+iq1.3
+iq1.4
+EOF
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --writer 3,1 \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    > $WORKDIR/iq1.txt \
+
+# Run the first iqsync; should copy everything
+log "sync iq2 from iq1"
+$PKGDIR/bin/iqsync \
+    -f $IQ2 \
+    --clone \
+    --verbose \
+    localhost:$IQ1 \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ2 \
+    > $WORKDIR/iq2.txt \
+
+diff $WORKDIR/iq{1,2}.txt || die "first sync failed"
+
+# Run the iqsync again; should be a nop
+log "sync iq2 from iq1 (nop)"
+$PKGDIR/bin/iqsync \
+    -f $IQ2 \
+    --clone \
+    --verbose \
+    localhost:$IQ1 \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    > $WORKDIR/iq1.txt \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ2 \
+    > $WORKDIR/iq2.txt \
+
+diff $WORKDIR/iq{1,2}.txt || die "second sync failed"
+
+# Add a few items to the first queue and update the heartbeat
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --line \
+    <<EOF
+iq2.1
+iq2.2
+iq2.3
+iq2.4
+EOF
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --writer 3,2 \
+
+# Run the iqsync again; should transfer the new items
+log "sync iq2 from iq1"
+$PKGDIR/bin/iqsync \
+    -f $IQ2 \
+    --clone \
+    --verbose \
+    localhost:$IQ1 \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    > $WORKDIR/iq1.txt \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ2 \
+    > $WORKDIR/iq2.txt \
+
+diff $WORKDIR/iq{1,2}.txt || die "third sync failed"
+
+# Generate iq3, with new data and sync it into iq1 and iq2
+log "create iq3"
+echo HEADER | ${PKGDIR}/bin/iqueue \
+    -f $IQ3 \
+    --create \
+    --header \
+|| die "$IQ3: Unable to create"
+
+$PKGDIR/bin/iqueue \
+    -f $IQ3 \
+    --line \
+    <<EOF
+iq3.1
+iq3.2
+iq3.3
+iq3.4
+EOF
+
+log "push iq3 into iq2"
+$PKGDIR/bin/iqsync \
+    -f $IQ3 \
+    --push \
+    --verbose \
+    localhost:$IQ2 \
+
+# Add a new item to iq3
+$PKGDIR/bin/iqueue \
+    -f $IQ3 \
+    --line \
+    <<EOF
+iq3.5
+iq3.6
+iq3.7
+iq3.8
+EOF
+
+log "push iq3 into iq1"
+$PKGDIR/bin/iqsync \
+    -f $IQ3 \
+    --push \
+    --verbose \
+    localhost:$IQ1 \
+
+# Add new items to iq1
+log "adding new items to iq1"
+# Add a few items to the first queue
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    --line \
+    <<EOF
+iq1.9
+iq1.10
+iq1.11
+iq1.12
+EOF
+
+
+# Now sync iq1 into iq2 again; this should skip the new entries from iq3,
+# but transfer the new items in iq1
+log "sync iq1 into iq2"
+$PKGDIR/bin/iqsync \
+    -f $IQ2 \
+    --pull \
+    --verbose \
+    localhost:$IQ1 \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ1 \
+    > $WORKDIR/iq1.txt \
+
+$PKGDIR/bin/iqueue \
+    -f $IQ2 \
+    > $WORKDIR/iq2.txt \
+
+diff $WORKDIR/iq{1,2}.txt || die "fourth sync failed"

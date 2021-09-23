@@ -1,0 +1,143 @@
+#! /bin/bash
+#   Copyright 2021 Two Sigma Open Source, LLC
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+
+
+# Global settings
+DIR=$(dirname $0)
+PROG=$(basename $0)
+PKGDIR=$(cd $(dirname ${0})/../..; pwd -L)
+
+# Populate the TS_*_HOME variables
+eval $($(${PKGDIR}/bin/gettools)/bin/makepath -s -r ${PKGDIR})
+
+WORKDIR="$(mktemp -d -t $PROG.XXXXXXXXXX)"
+DCATSIMPLE=${TS_DCAT_NATIVE_HOME}/bin/dcatsimple
+trap "rm -fr $WORKDIR" 0 1 2 3 15
+
+
+echo Using $WORKDIR
+IQ1=$WORKDIR/iq1.iqx
+IQ2=$WORKDIR/iq2.iqx
+OUT=$WORKDIR/test.out
+
+die() {
+    echo >&2 "$@"
+    exit 1
+}
+
+warn() {
+    echo >&2 "$@"
+}
+
+echo USER HEADER | ${PKGDIR}/bin/iqueue \
+    --create \
+    --header \
+    -f $IQ1 \
+|| die "$IQ1: Unable to create"
+
+
+#
+# Test the empty case, with a user header
+# we cut out the offset column because it can vary in size
+#
+${PKGDIR}/bin/iqueue -f $IQ1 --copyout | od -x | cut -d' ' -f2- > $OUT
+cat <<EOF | diff - $OUT || die "iq1 failed empty comparison"
+0000 0000 4344 5441 0200 0000 0c00 5355
+5245 4820 4145 4544 0a52 0000 0100 0000
+0300 736d 0067 0000 4c15 616a 6176 6e2e
+6f69 422e 7479 4265 6675 6566 3b72 ffff
+ffff
+0000102
+EOF
+
+
+# Duplicate the empty one to be sure it works
+${PKGDIR}/bin/iqueue -f $IQ1 --copyout | ${PKGDIR}/bin/iqueue --create -f $IQ2 --copyin
+${PKGDIR}/bin/iqueue -f $IQ2 | od -x | cut -d' ' -f2- > $OUT
+cat <<EOF | diff - $OUT || die "iq2 failed empty comparison"
+5355 5245 4820 4145 4544 0a52
+0000014
+EOF
+rm $IQ2
+
+
+echo "iq1 first entry" \
+| ${PKGDIR}/bin/iqueue \
+    --append \
+    -f $IQ1 \
+|| die "$IQ1: Unable to prime"
+
+# Ignore the timestamps
+${PKGDIR}/bin/iqueue -f $IQ1 --copyout | $DCATSIMPLE - | cut -d, -f2- > $OUT
+
+cat <<EOF | diff - $OUT || die "iq1 failed one entry comparison"
+msg
+69713120666972737420656e7472790a
+EOF
+
+for i in `seq 1 20`; do
+    echo entry $i
+done | ${PKGDIR}/bin/iqueue -f $IQ1 --line
+
+${PKGDIR}/bin/iqueue -f $IQ1 --copyout | $DCATSIMPLE - | cut -d, -f2- > $OUT
+
+cat <<EOF | diff - $OUT || die "iq1 failed bulk entry comparison"
+msg
+69713120666972737420656e7472790a
+656e7472792031
+656e7472792032
+656e7472792033
+656e7472792034
+656e7472792035
+656e7472792036
+656e7472792037
+656e7472792038
+656e7472792039
+656e747279203130
+656e747279203131
+656e747279203132
+656e747279203133
+656e747279203134
+656e747279203135
+656e747279203136
+656e747279203137
+656e747279203138
+656e747279203139
+656e747279203230
+EOF
+
+${PKGDIR}/bin/iqueue -f $IQ1 --copyout | ${PKGDIR}/bin/iqueue --create -f $IQ2 --copyin
+${PKGDIR}/bin/iqueue -f $IQ2 | od -x | cut -d' ' -f2- > $OUT
+cat <<EOF | diff - $OUT || die "iq2 failed full comparison"
+5355 5245 4820 4145 4544 0a52 7169 2031
+6966 7372 2074 6e65 7274 5c79 3130 0a32
+6e65 7274 2079 0a31 6e65 7274 2079 0a32
+6e65 7274 2079 0a33 6e65 7274 2079 0a34
+6e65 7274 2079 0a35 6e65 7274 2079 0a36
+6e65 7274 2079 0a37 6e65 7274 2079 0a38
+6e65 7274 2079 0a39 6e65 7274 2079 3031
+650a 746e 7972 3120 0a31 6e65 7274 2079
+3231 650a 746e 7972 3120 0a33 6e65 7274
+2079 3431 650a 746e 7972 3120 0a35 6e65
+7274 2079 3631 650a 746e 7972 3120 0a37
+6e65 7274 2079 3831 650a 746e 7972 3120
+0a39 6e65 7274 2079 3032 000a
+0000313
+EOF
+rm $IQ2
+
+
+echo >&2 "$0: Test passed"
+exit 0
