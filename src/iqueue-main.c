@@ -41,8 +41,6 @@ static struct option long_options[] = {
     { "zero",           no_argument,        0, '0' },
     { "binary",         no_argument,        0, 'b' },
     { "no-header",      no_argument,        0, 'N' },
-    { "copyin",         no_argument,        0, '1' },
-    { "copyout",        no_argument,        0, '2' },
     { "writer",         required_argument,  0, 'W' },
     { "print-entry",    required_argument,  0, 'n' },
     { "begin",          required_argument,  0, 'B' },
@@ -85,17 +83,6 @@ usage(
 "   -d | --debug N              Debug entry N (or the entire queue if N==-1)\n"
 "   -b | --binary               Print binary messages\n"
 "   -0 | -z | --zero            Print nul-separated messages in ascii mode\n"
-"\n"
-"DCAT formatting:\n"
-"\n"
-"For archiving and version transformations, iqueues can be transformed into\n"
-"a DC formatted file with --copyout.  The user header will be populated\n"
-"into the DC user header, and restored when a new iqueue is created.\n"
-"\n"
-"   --copyout                   Output in a form suitable for --copyin\n"
-"   --copyin                    Read in the form output by --copyout,\n"
-"                               implies --create, and will copy user header\n"
-"                               from dcat file.\n"
 ;
 
     fprintf(stream, "%s%s", msg, usage_str);
